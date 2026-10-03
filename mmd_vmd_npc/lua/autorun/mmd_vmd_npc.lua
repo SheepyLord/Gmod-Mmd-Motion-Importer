@@ -5,6 +5,7 @@ if SERVER then
     AddCSLuaFile("mmd_vmd_npc/cl_radial.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_camera.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_menu.lua")
+    AddCSLuaFile("mmd_vmd_npc/cl_build_worker.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_flashlight.lua")
 
     util.AddNetworkString("mmdvmd_list_request")
@@ -33,6 +34,7 @@ if SERVER then
     util.AddNetworkString("mmdvmd_build_compact_request")
     util.AddNetworkString("mmdvmd_build_frame_request")
     util.AddNetworkString("mmdvmd_build_frame_result")
+    util.AddNetworkString("mmdvmd_build_heartbeat")
     util.AddNetworkString("mmdvmd_build_done")
     util.AddNetworkString("mmdvmd_build_progress")
     util.AddNetworkString("mmdvmd_build_cancel_request")

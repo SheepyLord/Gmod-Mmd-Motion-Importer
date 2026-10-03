@@ -476,6 +476,10 @@ end
 
 clear_build_job = function(ply)
     local job = MMDVMDNPC.BuildJobs[ply]
+    if job and job.cacheWriter then
+        MMDVMDNPC.CancelBuiltCacheWrite(job.cacheWriter)
+        job.cacheWriter = nil
+    end
     if job and job.cvarSuppression then
         end_scoped_cvar_suppression(job.cvarSuppression)
         job.cvarSuppression = nil
@@ -695,7 +699,8 @@ end
 function MMDVMDNPC.CancelBuildTasksForPlayer(ply)
     if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
 
-    local activeCount = MMDVMDNPC.BuildJobs[ply] and 1 or 0
+    local activeJob = MMDVMDNPC.BuildJobs[ply]
+    local activeCount = activeJob and 1 or 0
     local queuedCount = build_queue_count(ply)
     local message = MMDVMDNPC.LFormat
         and MMDVMDNPC.LFormat("mmd_vmd_npc.console.build_cancelled_fmt", activeCount, queuedCount)
@@ -703,7 +708,8 @@ function MMDVMDNPC.CancelBuildTasksForPlayer(ply)
 
     MMDVMDNPC.BuildQueues[ply] = nil
     clear_build_job(ply)
-    send_build_done(ply, false, "", message)
+    MMDVMDNPC.PendingAutoPlay[ply] = nil
+    send_build_done(ply, false, "", message, activeJob and activeJob.id)
     send_build_progress(ply, "cancelled", {}, message)
     send_play_status(ply, "blocked", message)
     send_assignment_status(ply)
@@ -1049,10 +1055,10 @@ local function build_missing_instruction()
     return L("mmd_vmd_npc.status.build_missing_instruction", " Use Shift + left click to build the selected NPC animation(s).")
 end
 
-local function fail_ai_disabled_required(ply, forBuild)
+local function fail_ai_disabled_required(ply, forBuild, buildID)
     local message = ai_disabled_required_message()
     if forBuild then
-        send_build_done(ply, false, "", message)
+        send_build_done(ply, false, "", message, buildID)
     end
     send_play_status(ply, "error", message)
     MMDVMDNPC.Chat(ply, message)
@@ -1978,7 +1984,7 @@ local function send_build_frame_request(ply, job)
     if not ai_disabled_enabled() then
         clear_build_job(ply)
         MMDVMDNPC.BuildQueues[ply] = nil
-        fail_ai_disabled_required(ply, true)
+        fail_ai_disabled_required(ply, true, job.id)
         return
     end
     if not is_usable_npc(job.ent) then
@@ -2075,6 +2081,14 @@ local function send_build_plan(ply, job)
                 }
             end
         end
+        -- Optional plan tail: freeze the server's queued build options for
+        -- clients that time-slice the solve. Older clients ignore the tail.
+        -- A marker also distinguishes the tail from old-message padding.
+        net.WriteUInt(0x4D4D, 16)
+        net.WriteBool(job.options.disableArmTwist == true)
+        net.WriteBool(job.options.disableHandTwist == true)
+        net.WriteBool(job.options.disableEyes == true)
+        net.WriteBool(job.options.disableSpinePelvisCorrection == true)
     net.Send(ply)
 end
 
@@ -2098,15 +2112,39 @@ local function sorted_metadata(map)
     return out
 end
 
+local function complete_build(ply, job, built, path)
+    store_built_cache(path, built)
+    clear_build_job(ply)
+    send_assignment_status(ply)
+
+    send_build_done(ply, true, path, string.format("built %d frame(s)", #job.frames), job.id)
+    send_play_status(ply, "built", path)
+    local pendingPlay = MMDVMDNPC.PendingAutoPlay[ply]
+    if pendingPlay and pendingPlay.motionID == job.motionID then
+        MMDVMDNPC.PendingAutoPlay[ply] = nil
+        MMDVMDNPC.StartPlaybackForPlayer(ply, job.motionID, job.options, pendingPlay.settings)
+    end
+    if start_next_queued_build then start_next_queued_build(ply) end
+end
+
+local function fail_build_save(ply, job, message)
+    clear_build_job(ply)
+    MMDVMDNPC.PendingAutoPlay[ply] = nil
+    send_build_done(ply, false, "", message, job.id)
+    send_play_status(ply, "error", message)
+    send_assignment_status(ply)
+    if start_next_queued_build then start_next_queued_build(ply) end
+end
+
 local function finalize_build(ply, job)
     local path = MMDVMDNPC.BuiltPath(job.motionID, job.model, job.options)
     if not path then
-        clear_build_job(ply)
-        send_build_done(ply, false, "", "invalid built cache path")
+        fail_build_save(ply, job, "invalid built cache path")
         return
     end
 
-    table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
+    -- The receiver enforces consecutive frame numbers before appending, so
+    -- another O(n log n) sort at the end of a long build is unnecessary.
 
     local built = {
         format = MMDVMDNPC.BuiltFormat,
@@ -2136,20 +2174,29 @@ local function finalize_build(ply, job)
         frames = job.frames,
     }
 
-    file.CreateDir(MMDVMDNPC.BuiltRoot)
-    file.Write(path, util.TableToJSON(built, false))
-    store_built_cache(path, built)
-    clear_build_job(ply)
-    send_assignment_status(ply)
-
-    send_build_done(ply, true, path, string.format("built %d frame(s)", #job.frames), job.id)
-    send_play_status(ply, "built", path)
-    local pendingPlay = MMDVMDNPC.PendingAutoPlay[ply]
-    if pendingPlay and pendingPlay.motionID == job.motionID then
-        MMDVMDNPC.PendingAutoPlay[ply] = nil
-        MMDVMDNPC.StartPlaybackForPlayer(ply, job.motionID, job.options, pendingPlay.settings)
+    local writer, err = MMDVMDNPC.BeginBuiltCacheWrite(path, built, job.id)
+    if not writer then
+        fail_build_save(ply, job, err or "could not save built cache")
+        return
     end
-    if start_next_queued_build then start_next_queued_build(ply) end
+    job.cacheWriter = writer
+    job.finalizedBuilt = built
+    job.lastRequestedBuildFrames = nil
+    send_build_progress(ply, "building", job, "saving built animation")
+    send_play_status(ply, "building", "saving built animation")
+end
+
+local function advance_build_save(ply, job, now)
+    local done, err = MMDVMDNPC.StepBuiltCacheWrite(job.cacheWriter, 0.002)
+    if done == nil then
+        fail_build_save(ply, job, err or "could not save built cache")
+    elseif done then
+        complete_build(ply, job, job.finalizedBuilt, job.cacheWriter.path)
+    elseif now >= (job.nextSaveStatus or 0) then
+        job.nextSaveStatus = now + 0.25
+        send_build_progress(ply, "building", job,
+            string.format("saving built animation %d / %d", job.cacheWriter.nextFrame - 1, #job.frames))
+    end
 end
 
 local function load_built_animation(motionID, ent, options)
@@ -2351,7 +2398,7 @@ local function remove_motion_build_jobs(motionID)
         if job and tostring(job.motionID or "") == tostring(motionID or "") then
             clear_build_job(ply)
             if IsValid(ply) then
-                send_build_done(ply, false, "", "motion was deleted")
+                send_build_done(ply, false, "", "motion was deleted", job.id)
             end
         end
     end
@@ -3466,7 +3513,7 @@ local function update_build_job(ply, job, now)
         clear_build_job(ply)
         MMDVMDNPC.BuildQueues[ply] = nil
         freeze_player_target(job.ent, false)
-        fail_ai_disabled_required(ply, true)
+        fail_ai_disabled_required(ply, true, job.id)
         return
     end
     if not is_usable_npc(job.ent) then
@@ -3475,6 +3522,12 @@ local function update_build_job(ply, job, now)
         freeze_player_target(job.ent, false)
         send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
         if start_next_queued_build then start_next_queued_build(ply) end
+        return
+    end
+    -- Saving is part of the active cancellable job, and must never trigger a
+    -- client retry or release queued/autoplay work before the rename succeeds.
+    if job.cacheWriter then
+        advance_build_save(ply, job, now)
         return
     end
     local referenceInfo, referenceErr = lookup_required_reference_sequence_info(job.ent)
@@ -3515,7 +3568,7 @@ local function update_build_job(ply, job, now)
         return
     end
 
-    -- Progress otherwise depends entirely on the client answering each batch.
+    -- Progress comes from batch replies or strictly increasing frame heartbeats.
     -- If it never replies (Lua error, dropped request, oversized reply), the job
     -- would sit here forever holding cvar suppression and the frozen actor.
     -- Re-request the pending batch a few times, then abort so the queue and
@@ -4203,6 +4256,23 @@ net.Receive("mmdvmd_build_cancel_request", function(_, ply)
     MMDVMDNPC.CancelBuildTasksForPlayer(ply)
 end)
 
+-- A low-budget client can need several seconds to finish a batch while still
+-- completing frames. Only new progress inside the requested batch extends the
+-- timeout: repeated/out-of-range heartbeats cannot keep a stuck job alive.
+net.Receive("mmdvmd_build_heartbeat", function(_, ply)
+    local buildID = net.ReadUInt(32)
+    local completedFrame = net.ReadUInt(32)
+    local job = MMDVMDNPC.BuildJobs[ply]
+    if not job or job.id ~= buildID or not job.sentPlan or job.cacheWriter then return end
+    local count = tonumber(job.lastRequestedBuildFrames) or 0
+    if count <= 0 or not job.lastRequestAt then return end
+    local firstFrame = job.currentFrame
+    if completedFrame < firstFrame or completedFrame >= firstFrame + count then return end
+    if completedFrame <= (job.lastClientProgress or -1) then return end
+    job.lastClientProgress = completedFrame
+    job.lastRequestAt = CurTime()
+    job.buildRetries = 0
+end)
 net.Receive("mmdvmd_build_frame_result", function(_, ply)
     local buildID = net.ReadUInt(32)
     local resultCount = net.ReadUInt(8)
@@ -4216,7 +4286,7 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
     if not ai_disabled_enabled() then
         clear_build_job(ply)
         MMDVMDNPC.BuildQueues[ply] = nil
-        fail_ai_disabled_required(ply, true)
+        fail_ai_disabled_required(ply, true, job.id)
         return
     end
     if not is_usable_npc(job.ent) then
@@ -4234,8 +4304,12 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
     local maxFlexCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.flexTracks or {}))
 
     local expectedFrame = job.currentFrame
-    for _ = 1, resultCount do
+    for resultIndex = 1, resultCount do
         local frame = net.ReadUInt(32)
+        -- A retry may cross the previous reply on its way back to the client.
+        -- Dropping the whole stale message preserves the already accepted
+        -- frames; future/out-of-order frames still abort the build below.
+        if resultIndex == 1 and frame < expectedFrame then return end
         local boneCount = math.Clamp(net.ReadUInt(16), 0, maxBoneCount)
         if frame ~= expectedFrame then
             local abortedID = job.id

@@ -1,0 +1,148 @@
+{
+	"playbackStarted": 22.5224385,
+	"reference": "reference",
+	"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+	"tests": [
+		{
+			"detail": "",
+			"name": "client differential comparisons",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_cancel_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp0.json",
+			"name": "start mmd_perftest_cancel_3340206790",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "cancel removed server job and unpublished cache",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp0.json",
+			"name": "start mmd_perftest_3340206790",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp0.json",
+			"name": "network build publishes readable cache",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "cache contains all 10 sequential frames",
+			"passed": true
+		},
+		{
+			"detail": "21",
+			"name": "cache frames have resolved bones",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp0.json",
+			"name": "playback reloads saved cache",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "NPC playback remains active",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "NPC stop clears playback",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "player target selects supported model",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_cancel_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp1.json",
+			"name": "start mmd_perftest_cancel_3340206790",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "legacy player cancellation leaves no published cache",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp1.json",
+			"name": "start mmd_perftest_3340206790",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp1.json",
+			"name": "legacy player build publishes readable cache",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "legacy player cache contains 10 sequential frames",
+			"passed": true
+		},
+		{
+			"detail": "mmd_vmd_npc/built/mmd_perftest_3340206790_sheepylord_honkai_star_rail_firefly_1992945035_tw0_ht0_eye0_sp1.json",
+			"name": "self playback reloads legacy cache",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self playback creates dedicated proxy",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self playback hides and locks the player",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self playback remains active",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self stop clears proxy and playback mappings",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self stop restores player visibility",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self stop restores weapon visibility",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self stop releases movement",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "self stop removes proxy on the next tick",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "both worker modes cancelled during active slices",
+			"passed": true
+		},
+		{
+			"detail": "",
+			"name": "client workers and jobs cleaned up",
+			"passed": true
+		}
+	],
+	"selfPlaybackStopped": 32.9603426,
+	"failures": [],
+	"finished": true,
+	"selfPlaybackStarted": 29.9257137,
+	"elapsedSeconds": 27.6108057,
+	"started": 5.4576348999999995
+}

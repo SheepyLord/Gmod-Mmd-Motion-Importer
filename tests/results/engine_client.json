@@ -1,0 +1,235 @@
+{
+	"legacyModeVerified": true,
+	"cancelClearedWorker": true,
+	"failures": [],
+	"cancelledAfterSlices": 3,
+	"cancellations": [
+		{
+			"slices": 3,
+			"mode": "fast",
+			"workerCleared": true
+		},
+		{
+			"slices": 3,
+			"mode": "legacy",
+			"workerCleared": true
+		}
+	],
+	"comparisons": [
+		{
+			"results": [
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.0000019073486328125,
+						"maxAngularError": 0.048456642643301504,
+						"legacySeconds": 0.28438070000000515,
+						"fastSeconds": 0.020576000000007255,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						0,
+						0,
+						0
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.0000026973982585332124,
+						"maxAngularError": 0.048456642643301504,
+						"legacySeconds": 0.2816625999999953,
+						"fastSeconds": 0.01292479999999685,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						0,
+						123,
+						0
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.0000027392209176468896,
+						"maxAngularError": 0.048456642643301504,
+						"legacySeconds": 0.2743881000000066,
+						"fastSeconds": 0.020405200000002566,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						17,
+						-71,
+						11
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				}
+			],
+			"source": "synthetic",
+			"failed": 0,
+			"passed": 3,
+			"settings": {
+				"disable_armtwist": "0",
+				"disable_eyes": "0",
+				"fast_build": "1",
+				"disable_handtwist": "0",
+				"disable_spine_pelvis_correction": "0"
+			}
+		},
+		{
+			"results": [
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 5.960464477539063e-8,
+						"maxAngularError": 0.05233915627441309,
+						"legacySeconds": 0.10296100000000763,
+						"fastSeconds": 0.009101900000000995,
+						"fallbackFrames": 0,
+						"frameCount": 16,
+						"packetCount": 896
+					},
+					"angles": [
+						0,
+						0,
+						0
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.0000019073486328125,
+						"maxAngularError": 0.05233915627441309,
+						"legacySeconds": 0.11499600000000498,
+						"fastSeconds": 0.014123400000002562,
+						"fallbackFrames": 0,
+						"frameCount": 16,
+						"packetCount": 896
+					},
+					"angles": [
+						0,
+						123,
+						0
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.000003933906555175781,
+						"maxAngularError": 0.05233915627441309,
+						"legacySeconds": 0.10124250000000146,
+						"fastSeconds": 0.006849099999996611,
+						"fallbackFrames": 0,
+						"frameCount": 16,
+						"packetCount": 896
+					},
+					"angles": [
+						17,
+						-71,
+						11
+					],
+					"model": "models/sheepylord/honkai_star_rail/firefly.mdl",
+					"passed": true
+				}
+			],
+			"source": "motion_8f38d4be83_98de5fe977",
+			"failed": 0,
+			"passed": 3,
+			"settings": {
+				"disable_armtwist": "0",
+				"disable_eyes": "0",
+				"fast_build": "1",
+				"disable_handtwist": "0",
+				"disable_spine_pelvis_correction": "0"
+			}
+		},
+		{
+			"results": [
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.00000286102294921875,
+						"maxAngularError": 0.048456642643301504,
+						"legacySeconds": 0.10665720000000434,
+						"fastSeconds": 0.013150200000008994,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						0,
+						0,
+						0
+					],
+					"model": "models/player/kleiner.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.0000021324806311895372,
+						"maxAngularError": 0.05233915627441309,
+						"legacySeconds": 0.10550120000000263,
+						"fastSeconds": 0.01132780000000011,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						0,
+						123,
+						0
+					],
+					"model": "models/player/kleiner.mdl",
+					"passed": true
+				},
+				{
+					"report": {
+						"maxFlexError": 0,
+						"maxPositionError": 0.000003303624680484063,
+						"maxAngularError": 0.048456642643301504,
+						"legacySeconds": 0.11675299999999211,
+						"fastSeconds": 0.013097399999981718,
+						"fallbackFrames": 0,
+						"frameCount": 32,
+						"packetCount": 1696
+					},
+					"angles": [
+						17,
+						-71,
+						11
+					],
+					"model": "models/player/kleiner.mdl",
+					"passed": true
+				}
+			],
+			"source": "synthetic",
+			"failed": 0,
+			"passed": 3,
+			"settings": {
+				"disable_armtwist": "0",
+				"disable_eyes": "0",
+				"fast_build": "1",
+				"disable_handtwist": "0",
+				"disable_spine_pelvis_correction": "0"
+			}
+		}
+	],
+	"workerTasksRemaining": 0,
+	"buildJobsRemaining": 0
+}

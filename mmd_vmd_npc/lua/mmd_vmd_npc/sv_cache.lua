@@ -929,6 +929,132 @@ function MMDVMDNPC.LoadMotion(motionID)
     return motion
 end
 
+-- Write the existing JSON cache format incrementally. TableToJSON on an entire
+-- dance can allocate another giant string and block the server for seconds.
+-- The engine encoder still handles every value (including escaping/precision),
+-- but sees only the small header or one frame at a time. A partial cache is
+-- never exposed under the playable .json name.
+MMDVMDNPC.ActiveBuiltCacheWriters = MMDVMDNPC.ActiveBuiltCacheWriters or {}
+MMDVMDNPC.BuiltCacheWriteSerial = MMDVMDNPC.BuiltCacheWriteSerial or 0
+
+function MMDVMDNPC.CancelBuiltCacheWrite(writer)
+    if not writer then return end
+    MMDVMDNPC.ActiveBuiltCacheWriters[writer] = nil
+    if writer.handle then
+        pcall(writer.handle.Close, writer.handle)
+        writer.handle = nil
+    end
+    if writer.tempPath then
+        file.Delete(writer.tempPath)
+        writer.tempPath = nil
+    end
+end
+
+function MMDVMDNPC.BeginBuiltCacheWrite(path, built, token)
+    if not isstring(path) or path == "" or not istable(built) then
+        return nil, "invalid built cache write"
+    end
+    -- Build IDs can restart when sv_commands.lua auto-refreshes while existing
+    -- jobs survive. A persistent writer serial prevents two handles opening
+    -- (and truncating) the same temporary path after that refresh.
+    MMDVMDNPC.BuiltCacheWriteSerial = MMDVMDNPC.BuiltCacheWriteSerial + 1
+    local writer = {
+        path = path,
+        tempPath = path .. "." .. tostring(math.floor(tonumber(token) or 0))
+            .. "_" .. tostring(MMDVMDNPC.BuiltCacheWriteSerial) .. ".partial.dat",
+        frames = built.frames or {},
+        nextFrame = 1,
+        bytes = 0,
+    }
+    MMDVMDNPC.ActiveBuiltCacheWriters[writer] = true
+    local ok, err = pcall(function()
+        -- Do not deepcopy: the frame array dominates the allocation and is
+        -- deliberately excluded from the header passed to the JSON encoder.
+        local header = {}
+        for key, value in pairs(built) do
+            if key ~= "frames" then header[key] = value end
+        end
+        local encoded = util.TableToJSON(header, false)
+        if not encoded or string.sub(encoded, -1) ~= "}" then
+            error("failed to encode built cache header")
+        end
+        local prefix = string.sub(encoded, 1, -2)
+        prefix = prefix .. (next(header) and "," or "") .. '"frames":['
+        file.CreateDir(string.GetPathFromFilename(path))
+        writer.handle = file.Open(writer.tempPath, "wb", "DATA")
+        if not writer.handle then error("could not open built cache for writing") end
+        writer.handle:Write(prefix)
+        writer.bytes = #prefix
+    end)
+    if not ok then
+        MMDVMDNPC.CancelBuiltCacheWrite(writer)
+        return nil, tostring(err)
+    end
+    return writer
+end
+
+local function step_built_cache_write(writer, budgetSeconds)
+    local deadline = SysTime() + math.max(0.0001, tonumber(budgetSeconds) or 0.002)
+    local fragments, bytes, count = {}, 0, 0
+    while writer.nextFrame <= #writer.frames do
+        local encoded = util.TableToJSON(writer.frames[writer.nextFrame], false)
+        if not encoded then error("failed to encode built cache frame " .. writer.nextFrame) end
+        if writer.nextFrame > 1 then encoded = "," .. encoded end
+        fragments[#fragments + 1] = encoded
+        bytes = bytes + #encoded
+        writer.nextFrame = writer.nextFrame + 1
+        count = count + 1
+        -- The clock is a soft budget: one engine serialization/write cannot be
+        -- interrupted. Caps also bound work if SysTime has coarse precision.
+        if SysTime() >= deadline or bytes >= 65536 or count >= 32 then break end
+    end
+    if bytes > 0 then
+        writer.handle:Write(table.concat(fragments))
+        writer.bytes = writer.bytes + bytes
+    end
+    if writer.nextFrame <= #writer.frames then return false end
+
+    writer.handle:Write("]}")
+    writer.bytes = writer.bytes + 2
+    writer.handle:Close()
+    writer.handle = nil
+    -- File:Write has no success return. A size check catches a short write
+    -- (for example, a full disk) before publishing the file as a valid build.
+    if file.Size(writer.tempPath, "DATA") ~= writer.bytes then
+        error("built cache write was incomplete")
+    end
+    -- Another player's job may have completed the same model/motion meanwhile.
+    -- Keep that complete cache; never delete it to make a rename succeed.
+    if file.Exists(writer.path, "DATA") then
+        error("a built cache for this model and motion already exists")
+    end
+    if not file.Rename(writer.tempPath, writer.path) then
+        error("could not publish built cache")
+    end
+    writer.tempPath = nil
+    writer.complete = true
+    MMDVMDNPC.ActiveBuiltCacheWriters[writer] = nil
+    return true
+end
+
+-- true = committed, false = more ticks needed, nil/error = failed and cleaned.
+function MMDVMDNPC.StepBuiltCacheWrite(writer, budgetSeconds)
+    if not writer then return nil, "missing built cache writer" end
+    if writer.complete then return true end
+    if not writer.handle then return nil, "built cache writer is closed" end
+    local ok, result = pcall(step_built_cache_write, writer, budgetSeconds)
+    if not ok then
+        MMDVMDNPC.CancelBuiltCacheWrite(writer)
+        return nil, tostring(result)
+    end
+    return result
+end
+
+hook.Add("ShutDown", "MMDVMDNPCBuiltCacheWriterCleanup", function()
+    for writer in pairs(MMDVMDNPC.ActiveBuiltCacheWriters) do
+        MMDVMDNPC.CancelBuiltCacheWrite(writer)
+    end
+end)
 function MMDVMDNPC.ClearMotionCache()
     MMDVMDNPC.Cache = {}
 end

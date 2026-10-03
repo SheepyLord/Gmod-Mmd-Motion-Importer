@@ -746,9 +746,12 @@ function TOOL.BuildCPanel(panel)
         return string.find(haystack, query, 1, true) ~= nil
     end
 
+    local lastMotionRows
+    local lastMotionSelection
+    local motionLinesByID = {}
+
     local function refresh_motion_list_now()
         if not IsValid(motionList) then return end
-        motionList:Clear()
         local current = GetConVar("mmd_vmd_npc_motion")
         local selected = current and current:GetString() or ""
         local selectedLine = nil
@@ -793,24 +796,61 @@ function TOOL.BuildCPanel(panel)
             return a.id < b.id
         end)
         for _, row in ipairs(rows) do
-            local line = motionList:AddLine(motion_display_name(row.meta or row.id), english_text(row.meta), stool_category_text(row.meta), duration_text(row.meta))
-            line.MotionID = row.id
-            line.Meta = row.meta
-            if row.id == selected then selectedLine = line end
+            row.cells = { motion_display_name(row.meta or row.id), english_text(row.meta),
+                stool_category_text(row.meta), duration_text(row.meta) }
         end
 
         -- Keep the currently selected motion visible even when it is missing
         -- from the list (deleted) or hidden by the active filters.
-        if selected ~= "" and not selectedLine then
-            local label = seen[selected] and motion_display_name(selected) or selected
-            selectedLine = motionList:AddLine(label, english_text(detailsByID[selected]),
-                stool_category_text(detailsByID[selected]),
-                seen[selected] and duration_text(detailsByID[selected]) or L("mmd_vmd_npc.ui.missing"))
-            selectedLine.MotionID = selected
-            selectedLine.Meta = detailsByID[selected]
+        local hasSelectedRow = false
+        for _, row in ipairs(rows) do
+            if row.id == selected then hasSelectedRow = true break end
+        end
+        if selected ~= "" and not hasSelectedRow then
+            rows[#rows + 1] = {
+                id = selected,
+                meta = detailsByID[selected],
+                cells = { seen[selected] and motion_display_name(selected) or selected,
+                    english_text(detailsByID[selected]), stool_category_text(detailsByID[selected]),
+                    seen[selected] and duration_text(detailsByID[selected]) or L("mmd_vmd_npc.ui.missing") },
+            }
         end
 
-        if selectedLine then
+        -- Actor selection changes the per-model built flags, not these columns.
+        -- Retain Derma rows (and the scroll position) if their displayed values
+        -- and order are unchanged. Always refresh Meta: re-imports may change
+        -- non-displayed fields used by row actions without changing the labels.
+        local rowsChanged = not lastMotionRows or #rows ~= #lastMotionRows
+        if not rowsChanged then
+            for i, row in ipairs(rows) do
+                local previous = lastMotionRows[i]
+                if row.id ~= previous.id or not IsValid(motionLinesByID[row.id]) then
+                    rowsChanged = true
+                    break
+                end
+                for column, value in ipairs(row.cells) do
+                    if value ~= previous.cells[column] then rowsChanged = true break end
+                end
+                if rowsChanged then break end
+            end
+        end
+        if rowsChanged then
+            motionList:Clear()
+            motionLinesByID = {}
+        end
+        for _, row in ipairs(rows) do
+            local line = motionLinesByID[row.id]
+            if rowsChanged then
+                line = motionList:AddLine(unpack(row.cells))
+                line.MotionID = row.id
+                motionLinesByID[row.id] = line
+            end
+            line.Meta = row.meta
+            if row.id == selected then selectedLine = line end
+        end
+        lastMotionRows = rows
+
+        if selectedLine and (rowsChanged or selected ~= lastMotionSelection) then
             -- Purely visual re-selection: the motion convar already holds this
             -- id, so suppress OnRowSelected (it would fire a console command +
             -- an audio-settings net request per rebuild — i.e. per keystroke).
@@ -821,7 +861,10 @@ function TOOL.BuildCPanel(panel)
                 selectedLine:SetSelected(true)
             end
             suppressRowSelect = false
+        elseif not selectedLine and selected ~= lastMotionSelection and motionList.ClearSelection then
+            motionList:ClearSelection()
         end
+        lastMotionSelection = selected
     end
 
     -- The list/details hooks fire in bursts around every action; coalesce the
@@ -1078,6 +1121,8 @@ function TOOL.BuildCPanel(panel)
     section(performanceTab, L("mmd_vmd_npc.ui.build_performance"), Color(255, 190, 80))
     performanceTab:Help(L("mmd_vmd_npc.ui.build_performance_help"))
     add_checkbox_with_help(performanceTab, L("mmd_vmd_npc.ui.fast_build"), "mmd_vmd_npc_fast_build", L("mmd_vmd_npc.ui.fast_build_help"))
+    add_slider(performanceTab, L("mmd_vmd_npc.ui.build_budget_ms"), "mmd_vmd_npc_build_budget_ms", 0.5, 8, 1)
+    performanceTab:Help(L("mmd_vmd_npc.ui.build_budget_help"))
     -- Cap the slider at the value every consumer actually clamps to
     -- (clamp_build_frames_per_batch); a higher slider range silently lies.
     add_slider(performanceTab, L("mmd_vmd_npc.ui.build_frames_per_batch"), "mmd_vmd_npc_build_frames_per_batch", MMDVMDNPC.MinBuildFramesPerBatch or 1, MMDVMDNPC.MaxBuildFramesPerBatch or 128, 0)
