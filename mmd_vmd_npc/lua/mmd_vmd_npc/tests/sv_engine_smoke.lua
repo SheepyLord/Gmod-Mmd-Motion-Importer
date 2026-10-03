@@ -2,6 +2,7 @@
 -- Launch only with -port 27045 -clientport 27046 +lua_openscript mmd_vmd_npc/tests/sv_engine_smoke.lua
 -- tests/bootstrap.lua must be a staged copy of the addon's autorun entry point.
 if CLIENT then return end
+local port = GetConVar("hostport")
 assert(port and port:GetInt() == 27045, "MMD smoke runner is restricted to isolated test port 27045")
 if MMDVMDNPC and MMDVMDNPC.EngineSmokeRunning then return end
 MMDVMDNPC = MMDVMDNPC or {}
