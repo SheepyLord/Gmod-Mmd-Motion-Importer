@@ -220,7 +220,3 @@ Pass the path manually in the UI, or use CLI:
 ```powershell
 python tools/import_vmd.py "motions\dance.vmd" --gmod-dir "H:\SteamLibrary\steamapps\common\GarrysMod" --bake-with-blender --cache
 ```
-
-## In-game build performance
-
-Animation builds now run in short resumable steps, with a default 2 ms work budget per game frame. Adjust **Build Performance → Build time per game frame (ms)** to trade completion time for responsiveness. Existing built caches and playback remain compatible. See [the performance investigation](docs/build-performance.md) and [regression checks](tests/README.md).

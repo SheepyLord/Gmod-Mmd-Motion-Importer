@@ -5,8 +5,6 @@ MMDVMDNPC.TargetStatus = MMDVMDNPC.TargetStatus or {}
 MMDVMDNPC.BuildStatus = MMDVMDNPC.BuildStatus or {}
 MMDVMDNPC.PlayStatus = MMDVMDNPC.PlayStatus or {}
 MMDVMDNPC.ClientBuildJobs = MMDVMDNPC.ClientBuildJobs or {}
-MMDVMDNPC.BuildWorkerReloaded = MMDVMDNPC.BuildWorker ~= nil
-MMDVMDNPC.BuildWorker = include("mmd_vmd_npc/cl_build_worker.lua")
 MMDVMDNPC.ClientBuiltCache = MMDVMDNPC.ClientBuiltCache or {}
 MMDVMDNPC.MotionDetails = MMDVMDNPC.MotionDetails or {}
 MMDVMDNPC.AssignedActors = MMDVMDNPC.AssignedActors or { order = {}, byEnt = {} }
@@ -28,10 +26,6 @@ MMDVMDNPC.SelfCameraCenterOffset = MMDVMDNPC.SelfCameraCenterOffset or Vector(0,
 local DEBUG_REFERENCE_FRAME = -1
 local DEBUG_PREVIEW_TIMER = "MMDVMDNPCDebugPreviewPlay"
 local BUILD_DUMMY_SUPPRESSED_CVARS = { "skirt_vrd_auto_apply_all" }
-
-local function build_checkpoint()
-    MMDVMDNPC.BuildWorker:Checkpoint()
-end
 
 local function L(key, fallback)
     return MMDVMDNPC.L and MMDVMDNPC.L(key, fallback) or (fallback or key)
@@ -123,8 +117,6 @@ CreateClientConVar("mmd_vmd_npc_music_range", "1500", true, false, L("mmd_vmd_np
 CreateClientConVar("mmd_vmd_npc_music_fade", "300", true, false, L("mmd_vmd_npc.ui.music_fade"))
 CreateClientConVar("mmd_vmd_npc_loop_playback", "0", true, false, L("mmd_vmd_npc.ui.loop_playback"))
 CreateClientConVar("mmd_vmd_npc_build_frames_per_batch", tostring(MMDVMDNPC.DefaultBuildFramesPerBatch or 16), true, false, L("mmd_vmd_npc.ui.build_frames_per_batch"))
-CreateClientConVar("mmd_vmd_npc_build_budget_ms", "2", true, false, "Build CPU budget per rendered frame in milliseconds", 0.5, 8)
-CreateClientConVar("mmd_vmd_npc_fast_build", "1", true, false, L("mmd_vmd_npc.ui.fast_build"))
 CreateClientConVar("mmd_vmd_npc_playback_hz", tostring(MMDVMDNPC.DefaultPlaybackHz or 120), true, false, L("mmd_vmd_npc.ui.playback_updates_per_second"))
 CreateClientConVar("mmd_vmd_npc_hide_hud", "1", true, false, L("mmd_vmd_npc.ui.hide_hud"))
 CreateClientConVar("mmd_vmd_npc_hide_hud_key", "0", true, false, "Key code that toggles hiding the HUD during camera motion")
@@ -159,24 +151,14 @@ function MMDVMDNPC.RequestMotionList()
     request_list()
 end
 
-local motionDetailsRequestQueued = false
 local function request_motion_details()
-    -- Selecting one actor can emit target, assignment and build status together.
-    -- Request the model's details once after that burst, using the latest options.
-    -- Otherwise the server streams the entire motion library a second time when
-    -- its rate limit expires, even though the first response was already current.
-    if motionDetailsRequestQueued then return end
-    motionDetailsRequestQueued = true
-    timer.Simple(0, function()
-        motionDetailsRequestQueued = false
-        net.Start("mmdvmd_motion_details_request")
-            local options = selected_options and selected_options() or {}
-            net.WriteBool(options.disableArmTwist == true)
-            net.WriteBool(options.disableHandTwist == true)
-            net.WriteBool(options.disableEyes == true)
-            net.WriteBool(options.disableSpinePelvisCorrection == true)
-        net.SendToServer()
-    end)
+    net.Start("mmdvmd_motion_details_request")
+        local options = selected_options and selected_options() or {}
+        net.WriteBool(options.disableArmTwist == true)
+        net.WriteBool(options.disableHandTwist == true)
+        net.WriteBool(options.disableEyes == true)
+        net.WriteBool(options.disableSpinePelvisCorrection == true)
+    net.SendToServer()
 end
 
 function MMDVMDNPC.RequestMotionDetails()
@@ -287,10 +269,6 @@ function MMDVMDNPC.RequestBuildSelectedMotion()
 end
 
 function MMDVMDNPC.RequestCancelBuildTasks()
-    for buildID in pairs(MMDVMDNPC.ClientBuildJobs) do
-        MMDVMDNPC.BuildWorker:Cancel(buildID)
-        MMDVMDNPC.ClientBuildJobs[buildID].cancelled = true
-    end
     net.Start("mmdvmd_build_cancel_request")
     net.SendToServer()
 end
@@ -870,7 +848,6 @@ local function clear_all_bone_manipulations(ent)
     for bone = 0, count - 1 do
         if ent.ManipulateBoneAngles then ent:ManipulateBoneAngles(bone, ZERO_ANGLE, false) end
         if ent.ManipulateBonePosition then ent:ManipulateBonePosition(bone, ZERO_VECTOR) end
-        build_checkpoint()
     end
     setup_bones_now(ent)
 end
@@ -993,8 +970,6 @@ local function copy_vector(vec)
 end
 
 local function convar_bool(name, fallback)
-    local settings = MMDVMDNPC.BuildWorker.settings
-    if settings and settings[name] ~= nil then return settings[name] ~= 0 end
     local cvar = GetConVar(name)
     if not cvar then return fallback == true end
     return cvar:GetBool()
@@ -1294,20 +1269,6 @@ local function destroy_build_dummy()
     if IsValid(dummy) then dummy:Remove() end
     end_build_dummy_cvar_suppression()
 end
-
--- Auto-refresh cannot resume closures from the previous file safely. Cancel
--- explicitly rather than leaving pendingBatch set with no coroutine to run it.
-if MMDVMDNPC.BuildWorkerReloaded then
-    if next(MMDVMDNPC.ClientBuildJobs) then MMDVMDNPC.RequestCancelBuildTasks() end
-    MMDVMDNPC.ClientBuildJobs = {}
-    destroy_build_dummy()
-    MMDVMDNPC.BuildWorkerReloaded = nil
-end
-hook.Add("ShutDown", "MMDVMDNPCBuildCleanup", function()
-    for buildID in pairs(MMDVMDNPC.ClientBuildJobs) do MMDVMDNPC.BuildWorker:Cancel(buildID) end
-    MMDVMDNPC.ClientBuildJobs = {}
-    destroy_build_dummy()
-end)
 
 -- Build a hidden dummy for the given model. The optional target only supplies a
 -- world angle; retargeting produces bone-local manipulation angles that are
@@ -2377,8 +2338,6 @@ hook.Add("Think", "MMDVMDNPCEyeTrackCameraBridge", function()
 end)
 
 local function convar_float(name, fallback)
-    local settings = MMDVMDNPC.BuildWorker.settings
-    if settings and settings[name] ~= nil then return settings[name] end
     local cvar = GetConVar(name)
     if not cvar then return fallback end
     local value = cvar:GetFloat()
@@ -2501,7 +2460,6 @@ local function fast_skeleton_for_dummy(job, dummy)
             local _, localAng = WorldToLocal(ZERO_VECTOR, matrix:GetAngles(), ZERO_VECTOR, captureAng)
             cache.restLocal[bone] = localAng
         end
-        build_checkpoint()
     end
 
     cache.pelvisBone = dummy.LookupBone and dummy:LookupBone(SOURCE_PELVIS) or nil
@@ -2516,15 +2474,6 @@ end
 
 local function fast_annotate_rows(cache, dummy, rows)
     local bySource = cache.bySource
-    if cache.sources then
-        if #cache.sources ~= #rows then return false end
-        for index, row in ipairs(rows) do
-            if cache.sources[index] ~= row.source then return false end
-        end
-    else
-        cache.sources = {}
-        for index, row in ipairs(rows) do cache.sources[index] = row.source end
-    end
     for index, row in ipairs(rows) do
         local source = row.source or ""
         local info = bySource[source]
@@ -2543,18 +2492,12 @@ local function fast_annotate_rows(cache, dummy, rows)
         row.p = 0
         row.localYaw = 0
         row.r = 0
-        build_checkpoint()
     end
 
     if not cache.ancByBone then
         local tracked = {}
         for _, row in ipairs(rows) do
-            if row.resolved then
-                -- Multiple tracks for one bone require sequential readback;
-                -- use the legacy solver rather than assuming one transform.
-                if tracked[row.bone] then return false end
-                tracked[row.bone] = true
-            end
+            if row.resolved then tracked[row.bone] = true end
         end
 
         local ancByBone = {}
@@ -2585,37 +2528,6 @@ local function fast_annotate_rows(cache, dummy, rows)
     return true
 end
 
--- Rotate both orientation vectors together. The legacy Rodrigues helper
--- allocates intermediate Vectors and repeats normalization/sin/cos for each
--- vector. The axes are constant for a hidden build model; only the three
--- angles vary. Keep the same Y -> X -> Z global-axis composition.
-local function fast_rotate_model_angle(baseline, axes, degrees)
-    local forward, up = baseline:Forward(), baseline:Up()
-    local fx, fy, fz = forward.x, forward.y, forward.z
-    local ux, uy, uz = up.x, up.y, up.z
-    for index = 1, 3 do
-        local angle = index == 1 and degrees.y or (index == 2 and degrees.x or degrees.z)
-        if math.abs(angle or 0) >= 0.00001 then
-            local axis = axes[index]
-            local x, y, z = axis.x, axis.y, axis.z
-            local rad = math.rad(angle)
-            local c, sn = math.cos(rad), math.sin(rad)
-            local fd = (fx * x + fy * y + fz * z) * (1 - c)
-            local ud = (ux * x + uy * y + uz * z) * (1 - c)
-            fx, fy, fz = fx * c + (y * fz - z * fy) * sn + x * fd,
-                fy * c + (z * fx - x * fz) * sn + y * fd,
-                fz * c + (x * fy - y * fx) * sn + z * fd
-            ux, uy, uz = ux * c + (y * uz - z * uy) * sn + x * ud,
-                uy * c + (z * ux - x * uz) * sn + y * ud,
-                uz * c + (x * uy - y * ux) * sn + z * ud
-        end
-    end
-    forward, up = Vector(fx, fy, fz), Vector(ux, uy, uz)
-    forward:Normalize()
-    up:Normalize()
-    return clean_angle(forward:AngleEx(up))
-end
-
 local function fast_build_frame(job, dummy, rows, flexRows)
     local cache = fast_skeleton_for_dummy(job, dummy)
     if not cache then return nil end
@@ -2624,32 +2536,15 @@ local function fast_build_frame(job, dummy, rows, flexRows)
         return nil
     end
 
-    -- The plan is fixed for this job; compile the hierarchy order once.
-    if not cache.rowOrder then
-        local ordered = {}
-        for index, row in ipairs(rows) do ordered[index] = row end
-        table.sort(ordered, function(a, b)
-            if a.resolved ~= b.resolved then return a.resolved end
-            if a.depth ~= b.depth then return a.depth < b.depth end
-            if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
-            return a.index < b.index
-        end)
-        cache.rowOrder = {}
-        for index, row in ipairs(ordered) do cache.rowOrder[index] = row.index end
-    end
-    local ordered = {}
-    for index, sourceIndex in ipairs(cache.rowOrder) do ordered[index] = rows[sourceIndex] end
-    rows = ordered
+    table.sort(rows, function(a, b)
+        if a.resolved ~= b.resolved then return a.resolved end
+        if a.depth ~= b.depth then return a.depth < b.depth end
+        if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
+        return (a.index or 0) < (b.index or 0)
+    end)
 
     local referenceInfo = cache.referenceInfo
-    if cache.pelvisBone and dummy.ManipulateBonePosition then
-        dummy:ManipulateBonePosition(cache.pelvisBone, ZERO_VECTOR)
-    end
     local entAngles = dummy:GetAngles()
-    if not cache.modelAxes then
-        cache.modelAxes = { entAngles:Right(), entAngles:Forward(), entAngles:Up() }
-        for _, axis in ipairs(cache.modelAxes) do axis:Normalize() end
-    end
     local packed = {}
     local packedByBone = {}
     local appliedAngles = {}
@@ -2697,8 +2592,8 @@ local function fast_build_frame(job, dummy, rows, flexRows)
                 -- engine lands exactly on desired and self-verification holds.
                 -- Descendants inherit the correction via curWorld.
                 local correction = cache.armCorrections and cache.armCorrections[bone] or nil
-                local desired = fast_rotate_model_angle(
-                    arm_corrected_baseline(baseline, correction), cache.modelAxes, degrees)
+                local desired = rotate_angle_around_sequential_model_axes(
+                    arm_corrected_baseline(baseline, correction), entAngles, degrees)
                 local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
                 local manip = clean_angle(localManip)
                 curWorld[bone] = desired
@@ -2714,7 +2609,6 @@ local function fast_build_frame(job, dummy, rows, flexRows)
                 if dummy.ManipulateBoneAngles then dummy:ManipulateBoneAngles(bone, manip, false) end
             end
         end
-        build_checkpoint()
     end
 
     setup_bones_now(dummy)
@@ -2725,10 +2619,7 @@ local function fast_build_frame(job, dummy, rows, flexRows)
         if matrix then
             local err = angle_error_degrees(matrix:GetAngles(), desired)
             if err > maxError then maxError = err end
-        else
-            maxError = math.huge
         end
-        build_checkpoint()
     end
     if maxError > FAST_BUILD_VERIFY_EPSILON then
         job.fastUnsafe = true
@@ -2800,7 +2691,6 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
         row.p = 0
         row.localYaw = 0
         row.r = 0
-        build_checkpoint()
     end
 
     table.sort(rows, function(a, b)
@@ -2865,7 +2755,6 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
                 end
             end
         end
-        build_checkpoint()
     end
 
     if spine_pelvis_correction_enabled() and pelvisBone and spineBone and referenceSpineVector and target.ManipulateBonePosition then
@@ -2911,68 +2800,6 @@ local function compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
         if packed then return packed, flexPacked end
     end
     return rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
-end
-
--- Development diagnostic used by tests/cl_build_regression.lua. No actors,
--- caches or network messages are modified. The real engine is the oracle.
-function MMDVMDNPC.CompareBuildPaths(model, frames, options)
-    if next(MMDVMDNPC.BuildWorker.tasks) then return nil, "a build is running" end
-    local fastDummy, legacyDummy
-    local ok, report = pcall(function()
-        local function create_dummy()
-            local ent = ClientsideModel(model, RENDERGROUP_OTHER)
-            if not IsValid(ent) then error("cannot create model " .. tostring(model)) end
-            ent:SetNoDraw(true)
-            ent:SetPos(ZERO_VECTOR)
-            ent:SetAngles(options and options.angles or ZERO_ANGLE)
-            return ent
-        end
-        fastDummy = create_dummy()
-        legacyDummy = create_dummy()
-        local result = {
-            frameCount = 0, packetCount = 0, maxAngularError = 0,
-            maxPositionError = 0, maxFlexError = 0, legacySeconds = 0,
-            fastSeconds = 0, fallbackFrames = 0,
-        }
-        local job = {}
-        for _, frame in ipairs(frames) do
-            local rows, flexRows = table.Copy(frame.rows or {}), table.Copy(frame.flexRows or {})
-            local started = SysTime()
-            local expected, expectedFlex = rebuild_debug_preview(rows, flexRows, 0, false, legacyDummy)
-            result.legacySeconds = result.legacySeconds + SysTime() - started
-            rows, flexRows = table.Copy(frame.rows or {}), table.Copy(frame.flexRows or {})
-            started = SysTime()
-            local actual, actualFlex
-            if not job.fastUnsafe then actual, actualFlex = fast_build_frame(job, fastDummy, rows, flexRows) end
-            if not actual then
-                result.fallbackFrames = result.fallbackFrames + 1
-                actual, actualFlex = rebuild_debug_preview(rows, flexRows, 0, false, fastDummy)
-            end
-            result.fastSeconds = result.fastSeconds + SysTime() - started
-            local byBone = {}
-            for _, packet in ipairs(actual) do byBone[packet.bone] = packet end
-            if #expected ~= #actual then error("bone packet count differs") end
-            for _, packet in ipairs(expected) do
-                local other = byBone[packet.bone]
-                if not other then error("bone packet missing: " .. packet.bone) end
-                result.maxAngularError = math.max(result.maxAngularError, angle_error_degrees(packet.ang, other.ang))
-                result.maxPositionError = math.max(result.maxPositionError, (packet.pos - other.pos):Length())
-                result.packetCount = result.packetCount + 1
-            end
-            if #expectedFlex ~= #actualFlex then error("flex packet count differs") end
-            for index, packet in ipairs(expectedFlex) do
-                local other = actualFlex[index]
-                if packet.flexID ~= other.flexID then error("flex packet ID differs") end
-                result.maxFlexError = math.max(result.maxFlexError, math.abs(packet.weight - other.weight))
-            end
-            result.frameCount = result.frameCount + 1
-        end
-        return result
-    end)
-    if IsValid(fastDummy) then fastDummy:Remove() end
-    if IsValid(legacyDummy) then legacyDummy:Remove() end
-    if not ok then return nil, tostring(report) end
-    return report
 end
 
 local function debug_flex_choice_label(row, index)
@@ -3950,17 +3777,7 @@ net.Receive("mmdvmd_build_plan", function()
         }
     end
 
-    local settings = {}
-    local _, bitsLeft = net.BytesLeft()
-    local modernPlan = (bitsLeft or 0) >= 20 and net.ReadUInt(16) == 0x4D4D
-    if modernPlan then
-        for _, name in ipairs({ "disable_armtwist", "disable_handtwist", "disable_eyes", "disable_spine_pelvis_correction" }) do
-            settings["mmd_vmd_npc_" .. name] = net.ReadBool() and 1 or 0
-        end
-    end
     MMDVMDNPC.ClientBuildJobs[buildID] = {
-        settings = settings,
-        serverSupportsHeartbeat = modernPlan,
         motionID = motionID,
         model = model,
         target = target,
@@ -3976,14 +3793,108 @@ net.Receive("mmdvmd_build_plan", function()
     }
 end)
 
--- Decode network messages promptly, then solve them on subsequent Think calls.
--- Network batch size controls throughput; the wall-clock budget controls hitches.
-local function send_build_results(buildID, results)
+net.Receive("mmdvmd_build_compact_request", function()
+    local buildID = net.ReadUInt(32)
+    local motionID = net.ReadString()
+    local batchCount = net.ReadUInt(8)
+    local job = MMDVMDNPC.ClientBuildJobs[buildID]
+    if not job then return end
+
+    local visibleTarget = job.target
+    -- Build from the plan's model string so a NULL/never-networked target does
+    -- not yield an empty (all-bones-dropped) build that the server would cache.
+    local dummy = build_dummy_for_model(job.model, visibleTarget)
+    if not IsValid(dummy) then
+        MMDVMDNPC.ClientBuildJobs[buildID] = nil
+        destroy_build_dummy()
+        net.Start("mmdvmd_build_cancel_request")
+        net.SendToServer()
+        print("[MMD VMD] " .. LF("mmd_vmd_npc.console.build_failed_fmt", "could not create a hidden model for '" .. tostring(job.model or "") .. "'"))
+        return
+    end
+    local results = {}
+    local lastFrame = job.frame_start or 0
+
+    for _ = 1, batchCount do
+        local activeFrame = net.ReadUInt(32)
+        local rows = {}
+        for index, track in ipairs(job.boneTracks or {}) do
+            rows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                role = track.role,
+                x = net.ReadFloat(),
+                y = net.ReadFloat(),
+                z = net.ReadFloat(),
+                px = net.ReadFloat(),
+                py = net.ReadFloat(),
+                pz = net.ReadFloat(),
+                resolved = track.resolved,
+                bone = track.bone,
+            }
+        end
+
+        local flexRows = {}
+        for index, track in ipairs(job.flexTracks or {}) do
+            flexRows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                resolvedName = track.resolvedName,
+                weight = net.ReadFloat(),
+                flexID = track.flexID,
+                resolved = track.resolved,
+            }
+        end
+
+        local targetEntIndex = IsValid(visibleTarget) and visibleTarget:EntIndex() or 0
+        local packed, flexPacked = compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
+        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
+
+        for _, row in ipairs(rows) do
+            if row.resolved and row.bone then
+                job.bonesByID[row.bone] = {
+                    id = row.bone,
+                    name = row.source or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    role = row.role or "",
+                }
+            end
+        end
+        for _, row in ipairs(flexRows) do
+            if row.resolved and row.flexID and row.flexID >= 0 then
+                job.flexesByID[row.flexID] = {
+                    id = row.flexID,
+                    name = row.resolvedName or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    resolved = row.resolvedName or "",
+                }
+            end
+        end
+
+        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
+        lastFrame = activeFrame
+    end
+
+    update_build_status({
+        status = "building",
+        message = string.format("%s frame %d", motionID, lastFrame),
+        buildID = buildID,
+        motionID = motionID,
+        model = job.model or "",
+        currentFrame = lastFrame + 1,
+        startFrame = job.frame_start or 0,
+        endFrame = job.frame_end or lastFrame,
+        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
+    })
+
     net.Start("mmdvmd_build_frame_result")
         net.WriteUInt(buildID, 32)
-        net.WriteUInt(#results, 8)
+        net.WriteUInt(math.min(#results, 255), 8)
         for _, result in ipairs(results) do
-            local packed, flexPacked = result.packed, result.flexPacked
+            local packed = result.packed or {}
+            local flexPacked = result.flexPacked or {}
             net.WriteUInt(math.max(0, result.frame), 32)
             net.WriteUInt(math.min(#packed, 4096), 16)
             for i = 1, math.min(#packed, 4096) do
@@ -4000,171 +3911,99 @@ local function send_build_results(buildID, results)
             end
         end
     net.SendToServer()
-end
-
-local function queue_build_batch(buildID, motionID, job, frames)
-    if #frames == 0 or job.cancelled then return end
-    -- A server retry must not restart a suspended solve or append duplicate frames.
-    if job.pendingBatch then return end
-    if job.lastBatchFirst == frames[1].frame and job.lastResults then
-        send_build_results(buildID, job.lastResults)
-        return
-    end
-    if frames[1].frame ~= (job.nextFrame or job.frame_start) then return end
-    job.pendingBatch = frames[1].frame
-    job.nextHeartbeatAt = SysTime() + 1
-    job.settings = job.settings or {}
-    for _, name in ipairs({
-        "disable_armtwist", "disable_handtwist", "disable_eyes",
-        "disable_spine_pelvis_correction", "fast_build",
-        "flex_scale_all", "flex_scale_eye", "flex_scale_brow", "flex_scale_mouth",
-    }) do
-        local key = "mmd_vmd_npc_" .. name
-        local cv = GetConVar(key)
-        if job.settings[key] == nil and cv then job.settings[key] = cv:GetFloat() end
-    end
-
-    local worker = MMDVMDNPC.BuildWorker
-    worker:Start(buildID, function()
-        -- Keep the hidden model's transform fixed throughout the solve, even if
-        -- the visible actor moves or leaves the PVS while a coroutine is paused.
-        local dummy = job.dummy
-        if not IsValid(dummy) then
-            dummy = build_dummy_for_model(job.model, job.target)
-            if not IsValid(dummy) then error("could not create hidden model: " .. tostring(job.model)) end
-            job.dummy = dummy
-        end
-        build_checkpoint()
-        local results = {}
-        for _, frame in ipairs(frames) do
-            local rows, flexRows = frame.rows, frame.flexRows
-            local packed, flexPacked = compute_build_frame(job, dummy, rows, flexRows, frame.targetEntIndex)
-            job.frames[frame.frame - job.frame_start + 1] = packet_to_frame_data(frame.frame, packed, flexPacked)
-            for _, row in ipairs(rows) do
-                if row.resolved and row.bone and not job.bonesByID[row.bone] then
-                    job.bonesByID[row.bone] = {
-                        id = row.bone, name = row.source or "", source = row.source or "",
-                        mmd = row.mmd or "", role = row.role or "",
-                    }
-                end
-            end
-            for _, row in ipairs(flexRows) do
-                if row.resolved and row.flexID and row.flexID >= 0 and not job.flexesByID[row.flexID] then
-                    job.flexesByID[row.flexID] = {
-                        id = row.flexID, name = row.resolvedName or "", source = row.source or "",
-                        mmd = row.mmd or "", resolved = row.resolvedName or "",
-                    }
-                end
-            end
-            results[#results + 1] = { frame = frame.frame, packed = packed, flexPacked = flexPacked }
-            job.completedFrame = frame.frame
-            build_checkpoint()
-        end
-        return results
-    end, function(results)
-        if MMDVMDNPC.ClientBuildJobs[buildID] ~= job or job.cancelled then return end
-        job.lastBatchFirst = job.pendingBatch
-        job.pendingBatch = nil
-        job.lastResults = results
-        job.nextFrame = results[#results].frame + 1
-        send_build_results(buildID, results)
-    end, function(message)
-        if MMDVMDNPC.ClientBuildJobs[buildID] ~= job then return end
-        job.pendingBatch = nil
-        job.cancelled = true
-        destroy_build_dummy()
-        net.Start("mmdvmd_build_cancel_request")
-        net.SendToServer()
-        print("[MMD VMD] " .. LF("mmd_vmd_npc.console.build_failed_fmt", message))
-    end)
-    worker.tasks[buildID].settings = job.settings
-end
-
-hook.Add("Think", "MMDVMDNPCBuildWorker", function()
-    local worker = MMDVMDNPC.BuildWorker
-    for buildID in pairs(worker.tasks) do
-        local job = MMDVMDNPC.ClientBuildJobs[buildID]
-        if not job or job.cancelled then worker:Cancel(buildID) end
-    end
-    local cv = GetConVar("mmd_vmd_npc_build_budget_ms")
-    worker:Step(math.Clamp(cv and cv:GetFloat() or 2, 0.5, 8) / 1000)
-    -- Progress updates are independent of network round trips, but do not
-    -- rebuild the HUD/UI once per animation frame.
-    for buildID, job in pairs(MMDVMDNPC.ClientBuildJobs) do
-        -- Slow clients may spend many render frames on one legacy batch.
-        -- Report advancing work so the server can distinguish this from a stall.
-        if not job.cancelled and job.serverSupportsHeartbeat and job.pendingBatch
-            and (job.completedFrame or -1) >= job.pendingBatch
-            and job.completedFrame ~= job.lastHeartbeatFrame
-            and SysTime() >= (job.nextHeartbeatAt or 0) then
-            job.nextHeartbeatAt = SysTime() + 1
-            job.lastHeartbeatFrame = job.completedFrame
-            net.Start("mmdvmd_build_heartbeat")
-            net.WriteUInt(buildID, 32)
-            net.WriteUInt(job.completedFrame, 32)
-            net.SendToServer()
-        end
-        if not job.cancelled and job.pendingBatch and job.completedFrame and SysTime() >= (job.nextProgressAt or 0) then
-            job.nextProgressAt = SysTime() + 0.1
-            update_build_status({
-                status = "building", message = string.format("%s frame %d", job.motionID, job.completedFrame),
-                buildID = buildID, motionID = job.motionID, model = job.model,
-                currentFrame = job.completedFrame + 1, startFrame = job.frame_start, endFrame = job.frame_end,
-                queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
-            })
-        end
-    end
 end)
 
-net.Receive("mmdvmd_build_compact_request", function()
-    local buildID = net.ReadUInt(32)
-    local motionID = net.ReadString()
-    local batchCount = net.ReadUInt(8)
-    local job = MMDVMDNPC.ClientBuildJobs[buildID]
-    if not job or job.cancelled then return end
-    local frames = {}
-    for offset = 1, batchCount do
-        local frame = { frame = net.ReadUInt(32), rows = {}, flexRows = {} }
-        for index, track in ipairs(job.boneTracks or {}) do
-            frame.rows[index] = {
-                mmd = track.mmd, source = track.source, role = track.role,
-                x = net.ReadFloat(), y = net.ReadFloat(), z = net.ReadFloat(),
-                px = net.ReadFloat(), py = net.ReadFloat(), pz = net.ReadFloat(),
-                resolved = track.resolved, bone = track.bone,
-            }
-        end
-        for index, track in ipairs(job.flexTracks or {}) do
-            frame.flexRows[index] = {
-                mmd = track.mmd, source = track.source, resolvedName = track.resolvedName,
-                weight = net.ReadFloat(), flexID = track.flexID, resolved = track.resolved,
-            }
-        end
-        frames[offset] = frame
-    end
-    queue_build_batch(buildID, motionID, job, frames)
-end)
-
--- Compatibility with servers using the older, expanded frame payload.
 net.Receive("mmdvmd_build_frame_request", function()
     local buildID = net.ReadUInt(32)
     local motionID = net.ReadString()
     local batchCount = net.ReadUInt(8)
     local job = MMDVMDNPC.ClientBuildJobs[buildID]
-    local frames = {}
-    for offset = 1, batchCount do
+
+    local results = {}
+    local lastFrame = 0
+    for _ = 1, batchCount do
         local startFrame, endFrame, activeFrame, _, _, fps, _, targetEntIndex, _referenceInfo, rows, flexRows = read_frame_payload()
-        local target = targetEntIndex > 0 and Entity(targetEntIndex) or nil
+        local visibleTarget = targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil
+        local dummy = build_dummy_for_target(visibleTarget)
+        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
+
         if not job then
             job = {
-                motionID = motionID, model = IsValid(target) and (target:GetModel() or "") or "", target = target,
-                fps = fps, frame_start = startFrame, frame_end = endFrame,
-                frames = {}, bonesByID = {}, flexesByID = {},
+                motionID = motionID,
+                model = IsValid(visibleTarget) and (visibleTarget:GetModel() or "") or "",
+                fps = fps,
+                frame_start = startFrame,
+                frame_end = endFrame,
+                frames = {},
+                bonesByID = {},
+                flexesByID = {},
             }
             MMDVMDNPC.ClientBuildJobs[buildID] = job
+        elseif job.model == "" and IsValid(visibleTarget) then
+            job.model = visibleTarget:GetModel() or ""
         end
-        frames[offset] = { frame = activeFrame, rows = rows, flexRows = flexRows, targetEntIndex = targetEntIndex }
+        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
+        for _, row in ipairs(rows or {}) do
+            if row.resolved and row.bone then
+                job.bonesByID[row.bone] = {
+                    id = row.bone,
+                    name = row.source or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    role = row.role or "",
+                }
+            end
+        end
+        for _, row in ipairs(flexRows or {}) do
+            if row.resolved and row.flexID and row.flexID >= 0 then
+                job.flexesByID[row.flexID] = {
+                    id = row.flexID,
+                    name = row.resolvedName or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    resolved = row.resolvedName or "",
+                }
+            end
+        end
+
+        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
+        lastFrame = activeFrame
     end
-    if job then queue_build_batch(buildID, motionID, job, frames) end
+
+    update_build_status({
+        status = "building",
+        message = string.format("%s frame %d", motionID, lastFrame),
+        buildID = buildID,
+        motionID = motionID,
+        model = job and job.model or "",
+        currentFrame = lastFrame + 1,
+        startFrame = job and job.frame_start or 0,
+        endFrame = job and job.frame_end or lastFrame,
+        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
+    })
+
+    net.Start("mmdvmd_build_frame_result")
+        net.WriteUInt(buildID, 32)
+        net.WriteUInt(math.min(#results, 255), 8)
+        for _, result in ipairs(results) do
+            local packed = result.packed or {}
+            local flexPacked = result.flexPacked or {}
+            net.WriteUInt(math.max(0, result.frame), 32)
+            net.WriteUInt(math.min(#packed, 4096), 16)
+            for i = 1, math.min(#packed, 4096) do
+                net.WriteUInt(packed[i].bone, 16)
+                net.WriteAngle(packed[i].ang)
+                net.WriteFloat(packed[i].pos.x)
+                net.WriteFloat(packed[i].pos.y)
+                net.WriteFloat(packed[i].pos.z)
+            end
+            net.WriteUInt(math.min(#flexPacked, 4096), 16)
+            for i = 1, math.min(#flexPacked, 4096) do
+                net.WriteInt(flexPacked[i].flexID, 16)
+                net.WriteFloat(flexPacked[i].weight)
+            end
+        end
+    net.SendToServer()
 end)
 
 net.Receive("mmdvmd_target_status", function()
@@ -4237,8 +4076,8 @@ net.Receive("mmdvmd_build_done", function()
     -- and its partial frames get miscached under the wrong path.
     local job = buildID ~= 0 and MMDVMDNPC.ClientBuildJobs and MMDVMDNPC.ClientBuildJobs[buildID] or nil
     if job then
-        MMDVMDNPC.BuildWorker:Cancel(buildID)
         if ok then
+            table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
             MMDVMDNPC.ClientBuiltCache[path] = {
                 format = MMDVMDNPC.BuiltFormat,
                 motion_id = job.motionID,
