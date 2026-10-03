@@ -695,7 +695,8 @@ end
 function MMDVMDNPC.CancelBuildTasksForPlayer(ply)
     if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
 
-    local activeCount = MMDVMDNPC.BuildJobs[ply] and 1 or 0
+    local activeJob = MMDVMDNPC.BuildJobs[ply]
+    local activeCount = activeJob and 1 or 0
     local queuedCount = build_queue_count(ply)
     local message = MMDVMDNPC.LFormat
         and MMDVMDNPC.LFormat("mmd_vmd_npc.console.build_cancelled_fmt", activeCount, queuedCount)
@@ -703,7 +704,9 @@ function MMDVMDNPC.CancelBuildTasksForPlayer(ply)
 
     MMDVMDNPC.BuildQueues[ply] = nil
     clear_build_job(ply)
-    send_build_done(ply, false, "", message)
+    -- The job id lets the client drop the job's queued batches and its hidden
+    -- build model (0 would leave them alive).
+    send_build_done(ply, false, "", message, activeJob and activeJob.id or 0)
     send_build_progress(ply, "cancelled", {}, message)
     send_play_status(ply, "blocked", message)
     send_assignment_status(ply)
@@ -1305,10 +1308,12 @@ local function reset_runtime_eye_tracking(ent, eyeState)
     end
 end
 
-force_reference_pose = function(ent)
+-- cachedInfo: the actor's already-resolved reference info (saves the
+-- sequence-list walk when re-posing every tick).
+force_reference_pose = function(ent, cachedInfo)
     if not is_usable_npc(ent) then return false end
 
-    local info = lookup_reference_sequence_info(ent)
+    local info = cachedInfo or lookup_reference_sequence_info(ent)
     local seq = info and info.seq or lookup_reference_sequence(ent)
     if not seq or seq < 0 then return false end
 
@@ -1846,20 +1851,18 @@ local function build_flex_rows(ply, motion, activeFrame, targetOverride)
     local target = targetOverride or MMDVMDNPC.DebugTargets[ply]
     local hasTarget = is_usable_npc(target)
     local referenceOnly = is_debug_reference_frame(activeFrame)
+    local flexIndex = hasTarget and MMDVMDNPC.BuildFlexIndex(target) or nil
 
     for index, track in ipairs(tracks) do
-        local flexID = -1
-        local resolvedName = ""
-        if hasTarget and MMDVMDNPC.ResolveFlexID then
-            flexID, resolvedName = MMDVMDNPC.ResolveFlexID(target, track.source or "", track.mmd or "")
-        end
+        local targets = hasTarget and MMDVMDNPC.ResolveFlexTargets(target, track.source or "", track.mmd or "", flexIndex) or {}
         rows[#rows + 1] = {
             index = index,
             track = track,
             weight = referenceOnly and 0 or sample_flex_track(track, activeFrame),
-            flexID = flexID or -1,
-            resolvedName = resolvedName or "",
-            resolved = flexID ~= nil and flexID >= 0,
+            flexID = targets[1] and targets[1].id or -1,
+            resolvedName = MMDVMDNPC.FlexTargetsLabel(targets),
+            resolved = targets[1] ~= nil,
+            targets = targets,
         }
     end
 
@@ -1914,6 +1917,13 @@ local function write_frame_payload(motion, motionID, activeFrame, startFrame, en
         net.WriteFloat(row.weight or 0)
         net.WriteInt(row.flexID or -1, 16)
         net.WriteBool(row.resolved == true)
+        local targets = row.targets or {}
+        local targetCount = math.min(#targets, 255)
+        net.WriteUInt(targetCount, 8)
+        for t = 1, targetCount do
+            net.WriteInt(targets[t].id, 16)
+            net.WriteString(targets[t].name or "")
+        end
     end
 end
 
@@ -1956,73 +1966,240 @@ end
 
 local start_next_queued_build
 
-local function safe_batch_count(job, requestedBatch)
-    local boneCount = #(job.motion.boneTracks or {})
-    local flexCount = #(job.motion.flexTracks or {})
-    -- Bound the batch by BOTH message directions. The server->client request is
-    -- 4 + 24*bones + 4*flexes bytes/frame; the client->server reply is larger
-    -- per resolved track (a bone entry is ~26 B, a flex entry 6 B, plus 8 B of
-    -- per-frame overhead vs 4). A batch that only fits the request can overflow
-    -- the 64KB reply and stall the build, so size against the worst of the two.
-    local requestPerFrame = 4 + boneCount * 24 + flexCount * 4
-    local replyPerFrame = 8 + boneCount * 26 + flexCount * 6
-    local perFrameBytes = math.max(requestPerFrame, replyPerFrame)
-    if perFrameBytes <= 0 then return requestedBatch end
+-- (Build helpers are scoped in do-blocks: this file's main chunk is near
+-- Lua's 200-local limit.)
+local build_track_modes, pump_build_requests
+do
+    -- Which sampled columns of each track actually vary. A constant column (one
+    -- key, or every key equal, e.g. the zero position of every bone but the
+    -- pelvis) is sent once in the build plan instead of in every frame of every
+    -- batch; the value is exactly what sample_track/sample_flex_track return for
+    -- any frame.
+    build_track_modes = function(job)
+        if job.trackModes then return job.trackModes, job.flexModes end
 
-    local maxFrames = math.floor((MAX_NET_MESSAGE_BYTES - 64) / perFrameBytes)
-    return math.max(1, math.min(requestedBatch, maxFrames))
-end
-
-local function send_build_frame_request(ply, job)
-    if not IsValid(ply) or not job then return end
-    if not ai_disabled_enabled() then
-        clear_build_job(ply)
-        MMDVMDNPC.BuildQueues[ply] = nil
-        fail_ai_disabled_required(ply, true)
-        return
-    end
-    if not is_usable_npc(job.ent) then
-        local abortedID = job.id
-        clear_build_job(ply)
-        send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
-        if start_next_queued_build then start_next_queued_build(ply) end
-        return
-    end
-
-    local batchCount = math.min(clamp_build_frames_per_batch(job.buildFramesPerBatch), job.endFrame - job.currentFrame + 1)
-    batchCount = safe_batch_count(job, batchCount)
-    if batchCount <= 0 then return end
-    job.lastRequestedBuildFrames = batchCount
-    job.lastRequestAt = CurTime()
-    send_build_progress(
-        ply,
-        "building",
-        job,
-        string.format("building frames %d-%d / %d", job.currentFrame, math.min(job.endFrame, job.currentFrame + batchCount - 1), job.endFrame)
-    )
-    net.Start("mmdvmd_build_compact_request")
-        net.WriteUInt(job.id, 32)
-        net.WriteString(job.motionID)
-        net.WriteUInt(batchCount, 8)
-        for offset = 0, batchCount - 1 do
-            local activeFrame = job.currentFrame + offset
-            net.WriteUInt(math.max(0, activeFrame), 32)
-            for _, track in ipairs(job.motion.boneTracks or {}) do
-                local x, y, z, px, py, pz = sample_track(track, activeFrame)
-                net.WriteFloat(x or 0)
-                net.WriteFloat(y or 0)
-                net.WriteFloat(z or 0)
-                net.WriteFloat(px or 0)
-                net.WriteFloat(py or 0)
-                net.WriteFloat(pz or 0)
+        local trackModes = {}
+        for index, track in ipairs(job.motion.boneTracks or {}) do
+            local keys = track.keys or {}
+            local first = keys[1]
+            local mode = { animRot = false, animPos = false, x = 0, y = 0, z = 0, px = 0, py = 0, pz = 0 }
+            if first then
+                mode.x, mode.y, mode.z, mode.px, mode.py, mode.pz = first.x, first.y, first.z, first.px, first.py, first.pz
+                for k = 2, #keys do
+                    local key = keys[k]
+                    if not mode.animRot and (key.x ~= first.x or key.y ~= first.y or key.z ~= first.z) then mode.animRot = true end
+                    if not mode.animPos and (key.px ~= first.px or key.py ~= first.py or key.pz ~= first.pz) then mode.animPos = true end
+                    if mode.animRot and mode.animPos then break end
+                end
             end
-            for _, track in ipairs(job.motion.flexTracks or {}) do
-                net.WriteFloat(sample_flex_track(track, activeFrame) or 0)
+            trackModes[index] = mode
+        end
+
+        local flexModes = {}
+        for index, track in ipairs(job.motion.flexTracks or {}) do
+            local keys = track.keys or {}
+            local first = keys[1]
+            local mode = { animated = false, weight = first and (first.weight or 0) or 0 }
+            if first then
+                for k = 2, #keys do
+                    if keys[k].weight ~= first.weight then
+                        mode.animated = true
+                        break
+                    end
+                end
+            end
+            flexModes[index] = mode
+        end
+
+        job.trackModes, job.flexModes = trackModes, flexModes
+        return trackModes, flexModes
+    end
+
+    -- Largest key index at or before frame. Build frames only move forward, so the
+    -- search resumes from the previous sample's key instead of bisecting again; a
+    -- re-requested (earlier) frame falls back to the binary search.
+    local function track_cursor_index(keys, frame, cursors, slot)
+        local count = #keys
+        local index = cursors[slot]
+        if not index or index > count or keys[index].frame > frame then
+            index = track_span_index(keys, frame)
+        else
+            while index < count and keys[index + 1].frame <= frame do
+                index = index + 1
             end
         end
-    net.Send(ply)
+        cursors[slot] = index
+        return index
+    end
 
-    send_play_status(ply, "building", string.format("building frames %d-%d / %d", job.currentFrame, math.min(job.endFrame, job.currentFrame + batchCount - 1), job.endFrame))
+    -- sample_track / sample_flex_track with a per-track cursor; same arithmetic.
+    local function sample_track_at(track, frame, cursors, slot)
+        local keys = track and track.keys or {}
+        local count = #keys
+        if count <= 0 then return 0, 0, 0, 0, 0, 0 end
+        if frame <= keys[1].frame then
+            local key = keys[1]
+            return key.x, key.y, key.z, key.px, key.py, key.pz
+        end
+        if frame >= keys[count].frame then
+            local key = keys[count]
+            return key.x, key.y, key.z, key.px, key.py, key.pz
+        end
+
+        local index = track_cursor_index(keys, frame, cursors, slot)
+        local a = keys[index]
+        local b = keys[index + 1] or a
+        local span = math.max(0.000001, b.frame - a.frame)
+        local fraction = (frame - a.frame) / span
+        return lerp_value(a.x, b.x, fraction),
+            lerp_value(a.y, b.y, fraction),
+            lerp_value(a.z, b.z, fraction),
+            lerp_value(a.px, b.px, fraction),
+            lerp_value(a.py, b.py, fraction),
+            lerp_value(a.pz, b.pz, fraction)
+    end
+
+    local function sample_flex_track_at(track, frame, cursors, slot)
+        local keys = track and track.keys or {}
+        local count = #keys
+        if count <= 0 then return 0 end
+        if frame <= keys[1].frame then
+            return keys[1].weight or 0
+        end
+        if frame >= keys[count].frame then
+            return keys[count].weight or 0
+        end
+
+        local index = track_cursor_index(keys, frame, cursors, slot)
+        local a = keys[index]
+        local b = keys[index + 1] or a
+        local span = math.max(0.000001, b.frame - a.frame)
+        local fraction = (frame - a.frame) / span
+        return math.Clamp(lerp_value(a.weight, b.weight, fraction), 0, 1)
+    end
+
+    local function safe_batch_count(job, requestedBatch)
+        local trackModes, flexModes = build_track_modes(job)
+        local requestFloats = 0
+        for _, mode in ipairs(trackModes) do
+            if mode.animRot then requestFloats = requestFloats + 3 end
+            if mode.animPos then requestFloats = requestFloats + 3 end
+        end
+        for _, mode in ipairs(flexModes) do
+            if mode.animated then requestFloats = requestFloats + 1 end
+        end
+        -- Bound the batch by BOTH message directions. The server->client request
+        -- carries 4 bytes per varying column per frame. The client->server reply
+        -- carries, per frame, one net angle (at most 66 bits) per resolved bone
+        -- (+1 for a spine-correction pelvis packet), 96 bits for bones that move,
+        -- and 32 bits per resolved flex, after a per-message layout header. A batch
+        -- that only fits the request can overflow the 64KB reply, so size against
+        -- the worst of the two (the client also splits an oversized reply).
+        local boneSlots = (job.resolvedBoneCount or #trackModes) + 1
+        local positionSlots = (job.positionBoneCount or #trackModes) + 1
+        local flexSlots = job.resolvedFlexCount or #flexModes
+        local requestPerFrame = requestFloats * 4
+        local replyPerFrame = math.ceil((1 + boneSlots * 66 + positionSlots * 96 + flexSlots * 32) / 8)
+        local perFrameBytes = math.max(requestPerFrame, replyPerFrame, 1)
+        local headerBytes = 64 + boneSlots * 3 + flexSlots * 2
+
+        local maxFrames = math.floor((MAX_NET_MESSAGE_BYTES - headerBytes) / perFrameBytes)
+        return math.max(1, math.min(requestedBatch, maxFrames, 255))
+    end
+
+    -- Batches in flight per build. The client solves one batch per frame; keeping
+    -- the next ones already queued hides the request/reply round trip. Remote
+    -- clients get a shallower pipeline so build traffic cannot queue far ahead of
+    -- every other reliable message on a rate-limited connection.
+    local BUILD_PIPELINE_LOCAL = 4
+    local BUILD_PIPELINE_REMOTE = 2
+
+    local function build_pipeline_depth(ply)
+        if game.SinglePlayer() or (ply.IsListenServerHost and ply:IsListenServerHost()) then
+            return BUILD_PIPELINE_LOCAL
+        end
+        return BUILD_PIPELINE_REMOTE
+    end
+
+    local function write_build_request(ply, job, firstFrame, batchCount)
+        local trackModes, flexModes = build_track_modes(job)
+        local boneTracks = job.motion.boneTracks or {}
+        local flexTracks = job.motion.flexTracks or {}
+        local cursors = job.sampleCursors
+        if not cursors then
+            cursors = { bones = {}, flexes = {} }
+            job.sampleCursors = cursors
+        end
+        local boneCursors, flexCursors = cursors.bones, cursors.flexes
+
+        net.Start("mmdvmd_build_compact_request")
+            net.WriteUInt(job.id, 32)
+            net.WriteUInt(firstFrame, 32)
+            net.WriteUInt(batchCount, 8)
+            for frame = firstFrame, firstFrame + batchCount - 1 do
+                for i = 1, #boneTracks do
+                    local mode = trackModes[i]
+                    if mode.animRot or mode.animPos then
+                        local x, y, z, px, py, pz = sample_track_at(boneTracks[i], frame, boneCursors, i)
+                        if mode.animRot then
+                            net.WriteFloat(x or 0)
+                            net.WriteFloat(y or 0)
+                            net.WriteFloat(z or 0)
+                        end
+                        if mode.animPos then
+                            net.WriteFloat(px or 0)
+                            net.WriteFloat(py or 0)
+                            net.WriteFloat(pz or 0)
+                        end
+                    end
+                end
+                for i = 1, #flexTracks do
+                    if flexModes[i].animated then
+                        net.WriteFloat(sample_flex_track_at(flexTracks[i], frame, flexCursors, i) or 0)
+                    end
+                end
+            end
+        net.Send(ply)
+    end
+
+    -- Tops the job's pipeline up to build_pipeline_depth outstanding batches.
+    pump_build_requests = function(ply, job)
+        if not IsValid(ply) or not job then return end
+        if not ai_disabled_enabled() then
+            clear_build_job(ply)
+            MMDVMDNPC.BuildQueues[ply] = nil
+            fail_ai_disabled_required(ply, true)
+            return
+        end
+        if not is_usable_npc(job.ent) then
+            local abortedID = job.id
+            clear_build_job(ply)
+            send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
+            if start_next_queued_build then start_next_queued_build(ply) end
+            return
+        end
+
+        job.inflight = job.inflight or {}
+        job.nextRequestFrame = job.nextRequestFrame or job.currentFrame
+        local depth = build_pipeline_depth(ply)
+        local sent = false
+        while #job.inflight < depth and job.nextRequestFrame <= job.endFrame do
+            local batchCount = math.min(clamp_build_frames_per_batch(job.buildFramesPerBatch), job.endFrame - job.nextRequestFrame + 1)
+            batchCount = safe_batch_count(job, batchCount)
+            if batchCount <= 0 then break end
+            local firstFrame = job.nextRequestFrame
+            write_build_request(ply, job, firstFrame, batchCount)
+            job.inflight[#job.inflight + 1] = { first = firstFrame, count = batchCount }
+            job.nextRequestFrame = firstFrame + batchCount
+            sent = true
+        end
+        if not sent then return end
+
+        job.lastRequestAt = CurTime()
+        local message = string.format("building frames %d-%d / %d", job.currentFrame, job.nextRequestFrame - 1, job.endFrame)
+        send_build_progress(ply, "building", job, message)
+        send_play_status(ply, "building", message)
+    end
 end
 
 local function send_build_plan(ply, job)
@@ -2030,6 +2207,8 @@ local function send_build_plan(ply, job)
 
     local boneTracks = job.motion.boneTracks or {}
     local flexTracks = job.motion.flexTracks or {}
+    local trackModes, flexModes = build_track_modes(job)
+    local resolvedBones, positionBones, resolvedFlexes = 0, 0, 0
     net.Start("mmdvmd_build_plan")
         net.WriteUInt(job.id, 32)
         net.WriteString(job.motionID)
@@ -2042,13 +2221,30 @@ local function send_build_plan(ply, job)
         net.WriteUInt(math.min(#boneTracks, 4096), 16)
         for i = 1, math.min(#boneTracks, 4096) do
             local track = boneTracks[i]
+            local mode = trackModes[i]
             local bone = job.ent.LookupBone and job.ent:LookupBone(track.source or "") or nil
             net.WriteString(track.mmd or "")
             net.WriteString(track.source or "")
             net.WriteString(track.role or "")
             net.WriteBool(bone ~= nil)
             net.WriteUInt(math.max(0, bone or 0), 16)
+            net.WriteBool(mode.animRot)
+            if not mode.animRot then
+                net.WriteFloat(mode.x or 0)
+                net.WriteFloat(mode.y or 0)
+                net.WriteFloat(mode.z or 0)
+            end
+            net.WriteBool(mode.animPos)
+            if not mode.animPos then
+                net.WriteFloat(mode.px or 0)
+                net.WriteFloat(mode.py or 0)
+                net.WriteFloat(mode.pz or 0)
+            end
             if bone then
+                resolvedBones = resolvedBones + 1
+                if mode.animPos or mode.px ~= 0 or mode.py ~= 0 or mode.pz ~= 0 then
+                    positionBones = positionBones + 1
+                end
                 job.bones[bone] = {
                     name = job.ent.GetBoneName and (job.ent:GetBoneName(bone) or "") or "",
                     source = track.source or "",
@@ -2057,25 +2253,49 @@ local function send_build_plan(ply, job)
                 }
             end
         end
+        local flexIndex = MMDVMDNPC.BuildFlexIndex(job.ent)
+        local targetSeen = {}
         net.WriteUInt(math.min(#flexTracks, 4096), 16)
         for i = 1, math.min(#flexTracks, 4096) do
             local track = flexTracks[i]
-            local flexID, resolvedName = MMDVMDNPC.ResolveFlexID(job.ent, track.source or "", track.mmd or "")
+            local mode = flexModes[i]
+            -- A track can drive several model flexes (both halves of a split
+            -- controller, or a manual multi-flex mapping).
+            local targets = MMDVMDNPC.ResolveFlexTargets(job.ent, track.source or "", track.mmd or "", flexIndex)
+            local targetCount = math.min(#targets, 255)
             net.WriteString(track.mmd or "")
             net.WriteString(track.source or "")
-            net.WriteString(resolvedName or "")
-            net.WriteBool(flexID ~= nil and flexID >= 0)
-            net.WriteInt(flexID or -1, 16)
-            if flexID and flexID >= 0 then
-                job.flexes[flexID] = {
-                    name = job.ent.GetFlexName and (job.ent:GetFlexName(flexID) or "") or "",
+            net.WriteString(MMDVMDNPC.FlexTargetsLabel(targets))
+            net.WriteBool(targets[1] ~= nil)
+            net.WriteInt(targets[1] and targets[1].id or -1, 16)
+            net.WriteBool(mode.animated)
+            if not mode.animated then net.WriteFloat(mode.weight or 0) end
+            net.WriteUInt(targetCount, 8)
+            for t = 1, targetCount do
+                local target = targets[t]
+                net.WriteInt(target.id, 16)
+                net.WriteString(target.name or "")
+                if not targetSeen[target.id] then
+                    targetSeen[target.id] = true
+                    resolvedFlexes = resolvedFlexes + 1
+                end
+                job.flexes[target.id] = {
+                    name = job.ent.GetFlexName and (job.ent:GetFlexName(target.id) or "") or "",
                     source = track.source or "",
                     mmd = track.mmd or "",
-                    resolved = resolvedName or "",
+                    resolved = target.name or "",
                 }
             end
         end
+        -- The client solves with the options this build is cached under.
+        local options = job.options or {}
+        net.WriteBool(options.disableArmTwist == true)
+        net.WriteBool(options.disableHandTwist == true)
+        net.WriteBool(options.disableEyes == true)
+        net.WriteBool(options.disableSpinePelvisCorrection == true)
     net.Send(ply)
+
+    job.resolvedBoneCount, job.positionBoneCount, job.resolvedFlexCount = resolvedBones, positionBones, resolvedFlexes
 end
 
 local function sorted_metadata(map)
@@ -2098,6 +2318,55 @@ local function sorted_metadata(map)
     return out
 end
 
+local encode_built_frame, built_json
+do
+    -- Built-cache JSON is produced incrementally: every accepted result message
+    -- appends its frames' JSON text, and the final file is the small header from
+    -- util.TableToJSON with that text spliced in. Serializing the whole animation
+    -- (thousands of frames x dozens of bones) in one util.TableToJSON call froze
+    -- the game for seconds at the end of every build. The layout is the same
+    -- object util.JSONToTable has always read.
+    local jsonSmallNumberText = {}
+
+    local function json_number(value)
+        if value == 0 then return "0" end
+        if value == math.floor(value) and value > -1e15 and value < 1e15 then
+            return string.format("%d", value)
+        end
+        return string.format("%.17g", value)
+    end
+
+    -- Bone/flex ids and net angles (quantized to 1/32 degree) take few distinct
+    -- values that repeat in every frame; cache their text.
+    local function json_small_number(value)
+        local text = jsonSmallNumberText[value]
+        if text then return text end
+        text = json_number(value)
+        if value >= -360 and value <= 360 then jsonSmallNumberText[value] = text end
+        return text
+    end
+
+    encode_built_frame = function(frameData)
+        local bones = {}
+        for i, b in ipairs(frameData.bones) do
+            bones[i] = "[" .. json_small_number(b[1]) .. "," .. json_small_number(b[2]) .. "," .. json_small_number(b[3]) .. "," .. json_small_number(b[4])
+                .. "," .. json_number(b[5]) .. "," .. json_number(b[6]) .. "," .. json_number(b[7]) .. "]"
+        end
+        local flexes = {}
+        for i, f in ipairs(frameData.flexes) do
+            flexes[i] = "[" .. json_small_number(f[1]) .. "," .. json_number(f[2]) .. "]"
+        end
+        return '{"frame":' .. json_number(frameData.frame) .. ',"bones":[' .. table.concat(bones, ",")
+            .. '],"flexes":[' .. table.concat(flexes, ",") .. "]}"
+    end
+
+    built_json = function(header, frameChunks)
+        local text = string.gsub(util.TableToJSON(header, false) or "{}", "%s+$", "")
+        local prefix = text == "{}" and "{" or (string.sub(text, 1, -2) .. ",")
+        return table.concat({ prefix, '"frames":[', table.concat(frameChunks, ","), "]}" })
+    end
+end
+
 local function finalize_build(ply, job)
     local path = MMDVMDNPC.BuiltPath(job.motionID, job.model, job.options)
     if not path then
@@ -2106,8 +2375,7 @@ local function finalize_build(ply, job)
         return
     end
 
-    table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
-
+    -- Frames were accepted strictly in order, so job.frames is already sorted.
     local built = {
         format = MMDVMDNPC.BuiltFormat,
         motion_id = job.motionID,
@@ -2133,11 +2401,11 @@ local function finalize_build(ply, job)
         },
         bones = sorted_metadata(job.bones),
         flexes = sorted_metadata(job.flexes),
-        frames = job.frames,
     }
 
     file.CreateDir(MMDVMDNPC.BuiltRoot)
-    file.Write(path, util.TableToJSON(built, false))
+    file.Write(path, built_json(built, job.jsonChunks or {}))
+    built.frames = job.frames
     store_built_cache(path, built)
     clear_build_job(ply)
     send_assignment_status(ply)
@@ -2351,7 +2619,7 @@ local function remove_motion_build_jobs(motionID)
         if job and tostring(job.motionID or "") == tostring(motionID or "") then
             clear_build_job(ply)
             if IsValid(ply) then
-                send_build_done(ply, false, "", "motion was deleted")
+                send_build_done(ply, false, "", "motion was deleted", job.id)
             end
         end
     end
@@ -2622,67 +2890,77 @@ local cv_root_motion_origin = CreateConVar(
     "Carry the dance's root travel on the entity origin so characters can walk any distance (0 = legacy bone-offset only)"
 )
 
-local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset, state)
-    if not is_usable_npc(ent) then return end
+-- Reused engine objects for the per-tick pose writes (ManipulateBone* copies
+-- its argument), instead of a fresh Angle and Vector per bone per tick.
+local apply_built_sample
+do
+    local angleMeta, vectorMeta = FindMetaTable("Angle"), FindMetaTable("Vector")
+    local setAngle = angleMeta and angleMeta.SetUnpacked or function(a, p, y, r) a.p, a.y, a.r = p, y, r end
+    local setVector = vectorMeta and vectorMeta.SetUnpacked or function(v, x, y, z) v.x, v.y, v.z = x, y, z end
+    local sampleAngle, sampleVector = Angle(0, 0, 0), Vector(0, 0, 0)
 
-    frameA = frameA or {}
-    frameB = frameB or frameA
-    fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
-    pelvisZOffset = tonumber(pelvisZOffset) or 0
-    local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
-    local rootMotion = state ~= nil and cv_root_motion_origin:GetBool()
+    apply_built_sample = function(ent, frameA, frameB, fraction, pelvisZOffset, state)
+        if not is_usable_npc(ent) then return end
 
-    for index, boneA in ipairs(frameA.bones or {}) do
-        local boneB = (frameB.bones or {})[index] or boneA
-        local bone = tonumber(boneA[1]) or -1
-        if bone >= 0 then
-            local ang = Angle(
-                lerp_angle_value(boneA[2], boneB[2], fraction),
-                lerp_angle_value(boneA[3], boneB[3], fraction),
-                lerp_angle_value(boneA[4], boneB[4], fraction)
-            )
-            local pos = Vector(
-                lerp_value(boneA[5], boneB[5], fraction),
-                lerp_value(boneA[6], boneB[6], fraction),
-                lerp_value(boneA[7], boneB[7], fraction)
-            )
-            if pelvisBone and bone == pelvisBone then
-                pos.z = pos.z + pelvisZOffset
-                if rootMotion then
-                    -- Anchor once to the dance-start transform (set eagerly at
-                    -- playback start; guarded here for safety), then move the
-                    -- origin by the pelvis's horizontal travel rotated into
-                    -- world space. The manipulation keeps only the vertical
-                    -- component, which stays far inside the networked range.
-                    if not state.rootBase then
-                        state.rootBase = ent:GetPos()
-                        state.rootYaw = Angle(0, ent:GetAngles().y or 0, 0)
+        frameA = frameA or {}
+        frameB = frameB or frameA
+        fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
+        pelvisZOffset = tonumber(pelvisZOffset) or 0
+        local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
+        local rootMotion = state ~= nil and cv_root_motion_origin:GetBool()
+
+        local manipulatePosition = ent.ManipulateBonePosition
+        local bonesB = frameB.bones or {}
+        for index, boneA in ipairs(frameA.bones or {}) do
+            local boneB = bonesB[index] or boneA
+            local bone = tonumber(boneA[1]) or -1
+            if bone >= 0 then
+                local x = lerp_value(boneA[5], boneB[5], fraction)
+                local y = lerp_value(boneA[6], boneB[6], fraction)
+                local z = lerp_value(boneA[7], boneB[7], fraction)
+                if pelvisBone and bone == pelvisBone then
+                    z = z + pelvisZOffset
+                    if rootMotion then
+                        -- Anchor once to the dance-start transform (set eagerly at
+                        -- playback start; guarded here for safety), then move the
+                        -- origin by the pelvis's horizontal travel rotated into
+                        -- world space. The manipulation keeps only the vertical
+                        -- component, which stays far inside the networked range.
+                        if not state.rootBase then
+                            state.rootBase = ent:GetPos()
+                            state.rootYaw = Angle(0, ent:GetAngles().y or 0, 0)
+                        end
+                        local travel = Vector(x, y, 0)
+                        travel:Rotate(state.rootYaw)
+                        ent:SetPos(state.rootBase + travel)
+                        x = 0
+                        y = 0
                     end
-                    local travel = Vector(pos.x, pos.y, 0)
-                    travel:Rotate(state.rootYaw)
-                    ent:SetPos(state.rootBase + travel)
-                    pos.x = 0
-                    pos.y = 0
+                end
+                setAngle(sampleAngle,
+                    lerp_angle_value(boneA[2], boneB[2], fraction),
+                    lerp_angle_value(boneA[3], boneB[3], fraction),
+                    lerp_angle_value(boneA[4], boneB[4], fraction))
+                ent:ManipulateBoneAngles(bone, sampleAngle, true)
+                if manipulatePosition then
+                    setVector(sampleVector, x, y, z)
+                    manipulatePosition(ent, bone, sampleVector)
                 end
             end
-            ent:ManipulateBoneAngles(bone, ang, true)
-            if ent.ManipulateBonePosition then
-                ent:ManipulateBonePosition(bone, pos)
+        end
+
+        if ent.SetFlexWeight then
+            for index, flexA in ipairs(frameA.flexes or {}) do
+                local flexB = (frameB.flexes or {})[index] or flexA
+                local flexID = tonumber(flexA[1]) or -1
+                if flexID >= 0 then
+                    ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction), 0, 1))
+                end
             end
         end
-    end
 
-    if ent.SetFlexWeight then
-        for index, flexA in ipairs(frameA.flexes or {}) do
-            local flexB = (frameB.flexes or {})[index] or flexA
-            local flexID = tonumber(flexA[1]) or -1
-            if flexID >= 0 then
-                ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction), 0, 1))
-            end
-        end
+        setup_bones_now(ent)
     end
-
-    setup_bones_now(ent)
 end
 
 local function playback_initiator(state)
@@ -3477,23 +3755,30 @@ local function update_build_job(ply, job, now)
         if start_next_queued_build then start_next_queued_build(ply) end
         return
     end
-    local referenceInfo, referenceErr = lookup_required_reference_sequence_info(job.ent)
-    if not referenceInfo then
-        local message = referenceErr or missing_reference_sequence_message()
-        local abortedID = job.id
-        clear_build_job(ply)
-        freeze_player_target(job.ent, false)
-        send_build_done(ply, false, "", message, abortedID)
-        send_play_status(ply, "error", message, job.ent)
-        MMDVMDNPC.Chat(ply, message)
-        if start_next_queued_build then start_next_queued_build(ply) end
-        return
+    -- The required Reference sequence can only change with the model, and
+    -- the lookup walks the model's whole sequence list and re-poses the actor
+    -- twice; validate once per model instead of every tick of the build.
+    local model = job.ent:GetModel() or ""
+    if job.referenceCheckedModel ~= model then
+        local referenceInfo, referenceErr = lookup_required_reference_sequence_info(job.ent)
+        if not referenceInfo then
+            local message = referenceErr or missing_reference_sequence_message()
+            local abortedID = job.id
+            clear_build_job(ply)
+            freeze_player_target(job.ent, false)
+            send_build_done(ply, false, "", message, abortedID)
+            send_play_status(ply, "error", message, job.ent)
+            MMDVMDNPC.Chat(ply, message)
+            if start_next_queued_build then start_next_queued_build(ply) end
+            return
+        end
+        job.referenceCheckedModel = model
     end
 
     local delayUntil = tonumber(job.delayUntil) or 0
     if delayUntil > now then
         if job.holdVisibleReference ~= false then
-            force_reference_pose(job.ent)
+            force_reference_pose(job.ent, model == job.model and job.referenceInfo or nil)
             stop_actor_motion(job.ent)
         end
         if now >= (job.nextCountdownStatus or 0) then
@@ -3511,15 +3796,16 @@ local function update_build_job(ply, job, now)
         send_build_plan(ply, job)
         send_build_progress(ply, "building", job, "starting hidden-model build")
         send_play_status(ply, "building", "starting hidden-model build")
-        send_build_frame_request(ply, job)
+        pump_build_requests(ply, job)
         return
     end
 
     -- Progress otherwise depends entirely on the client answering each batch.
     -- If it never replies (Lua error, dropped request, oversized reply), the job
     -- would sit here forever holding cvar suppression and the frozen actor.
-    -- Re-request the pending batch a few times, then abort so the queue and
-    -- suppressed cvars are released.
+    -- Re-request the pending batches a few times, then abort so the queue and
+    -- suppressed cvars are released. lastRequestAt also advances on every
+    -- accepted reply.
     local lastRequestAt = tonumber(job.lastRequestAt) or now
     if now - lastRequestAt >= BUILD_STALL_SECONDS then
         job.buildRetries = (tonumber(job.buildRetries) or 0) + 1
@@ -3533,7 +3819,12 @@ local function update_build_job(ply, job, now)
             return
         end
         send_build_progress(ply, "building", job, string.format("client stalled; retrying batch (%d/%d)", job.buildRetries, BUILD_MAX_RETRIES))
-        send_build_frame_request(ply, job)
+        -- Everything in flight is presumed lost: request again from the first
+        -- missing frame (a late reply for it is still accepted, later
+        -- duplicates are ignored).
+        job.inflight = {}
+        job.nextRequestFrame = job.currentFrame
+        pump_build_requests(ply, job)
     end
 end
 
@@ -3716,6 +4007,9 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
     local mmdName = net.ReadString()
     local sourceName = net.ReadString()
     local flexName = net.ReadString()
+    -- "set": the morph drives only this flex. "add"/"remove": edit the list of
+    -- flexes it drives (one morph may drive several).
+    local operation = net.ReadString()
 
     if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then
         -- Silent returns here made the mapping buttons look dead; say why.
@@ -3723,13 +4017,44 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
         return
     end
     if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
-    local resolvedName = resolved_flex_name_on_entity(ent, flexName)
+    local resolvedName, resolvedID = resolved_flex_name_on_entity(ent, flexName)
     if not resolvedName then
         send_play_status(ply, "error", "selected model flex was not found", ent)
         return
     end
 
-    if not MMDVMDNPC.SetFlexOverrideForModel or not MMDVMDNPC.SetFlexOverrideForModel(ent:GetModel() or "", mmdName, sourceName, resolvedName) then
+    local names = { resolvedName }
+    if operation == "add" or operation == "remove" then
+        names = {}
+        local present = false
+        for _, target in ipairs(MMDVMDNPC.ResolveFlexTargets(ent, sourceName, mmdName)) do
+            if target.id == resolvedID then
+                present = true
+                if operation == "add" then names[#names + 1] = target.name end
+            else
+                names[#names + 1] = target.name
+            end
+        end
+        if operation == "add" and present then
+            send_play_status(ply, "error", string.format("%s already drives %s", tostring(mmdName ~= "" and mmdName or sourceName), resolvedName), ent)
+            return
+        end
+        if operation == "remove" and not present then
+            send_play_status(ply, "error", string.format("%s does not drive %s", tostring(mmdName ~= "" and mmdName or sourceName), resolvedName), ent)
+            return
+        end
+        if operation == "add" then names[#names + 1] = resolvedName end
+    end
+
+    -- Removing the last flex leaves the morph driving nothing (Clear Mapping
+    -- returns it to automatic resolution).
+    local saved
+    if #names > 0 then
+        saved = MMDVMDNPC.SetFlexOverrideForModel(ent:GetModel() or "", mmdName, sourceName, names)
+    else
+        saved = MMDVMDNPC.SetFlexUnassignedForModel(ent:GetModel() or "", mmdName, sourceName)
+    end
+    if not saved then
         send_play_status(ply, "error", "failed to save flex mapping", ent)
         return
     end
@@ -3738,7 +4063,7 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
     send_play_status(
         ply,
         "built",
-        string.format("saved flex mapping for %s; removed %d built cache(s) for this model", tostring(mmdName ~= "" and mmdName or sourceName), removed),
+        string.format("saved flex mapping for %s -> %s; removed %d built cache(s) for this model", tostring(mmdName ~= "" and mmdName or sourceName), #names > 0 and table.concat(names, " + ") or "nothing", removed),
         ent
     )
     queue_motion_details(ply, MMDVMDNPC.ToolOptions())
@@ -4205,14 +4530,19 @@ end)
 
 net.Receive("mmdvmd_build_frame_result", function(_, ply)
     local buildID = net.ReadUInt(32)
+    local firstFrame = net.ReadUInt(32)
     local resultCount = net.ReadUInt(8)
     local job = MMDVMDNPC.BuildJobs[ply]
     if not job or job.id ~= buildID then return end
-    -- Reject frame results that arrive before a batch was actually requested:
-    -- without a matching request a client could fabricate and persist a whole
-    -- built animation with no client-side retargeting pass.
-    if not job.sentPlan or not job.lastRequestedBuildFrames then return end
-    resultCount = math.Clamp(resultCount, 0, math.min(clamp_build_frames_per_batch(job.buildFramesPerBatch), tonumber(job.lastRequestedBuildFrames) or 255))
+    -- Only frames that were actually requested are accepted, strictly in
+    -- order: without a matching request a client could fabricate and persist
+    -- a whole built animation with no client-side retargeting pass. A reply
+    -- starting before currentFrame is a stale duplicate of a re-requested
+    -- batch and is ignored, as is anything out of order (the stall retry
+    -- re-requests from currentFrame).
+    if not job.sentPlan or firstFrame ~= job.currentFrame then return end
+    resultCount = math.min(resultCount, (job.nextRequestFrame or job.currentFrame) - firstFrame)
+    if resultCount <= 0 then return end
     if not ai_disabled_enabled() then
         clear_build_job(ply)
         MMDVMDNPC.BuildQueues[ply] = nil
@@ -4227,60 +4557,101 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
         return
     end
 
-    -- The client can only legitimately report as many tracks as the motion has;
-    -- bound the per-frame counts to the motion so a malicious client cannot
-    -- inflate every frame to 4096 tracks and exhaust server memory/disk.
-    local maxBoneCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.boneTracks or {}))
-    local maxFlexCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.flexTracks or {}))
+    -- The client can only legitimately report as many tracks as the motion has
+    -- (plus a spine-correction pelvis packet) and one flex packet per model
+    -- flex the plan resolved; bound every count so a malicious client cannot
+    -- inflate frames and exhaust server memory/disk.
+    local maxBoneCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.boneTracks or {}) + 1)
+    local maxFlexCount = math.min(BUILD_PACKET_LIMIT, math.max(#(job.motion.flexTracks or {}), job.resolvedFlexCount or 0))
 
-    local expectedFrame = job.currentFrame
-    for _ = 1, resultCount do
-        local frame = net.ReadUInt(32)
-        local boneCount = math.Clamp(net.ReadUInt(16), 0, maxBoneCount)
-        if frame ~= expectedFrame then
-            local abortedID = job.id
-            clear_build_job(ply)
-            send_build_done(ply, false, "", "build frame order mismatch", abortedID)
-            if start_next_queued_build then start_next_queued_build(ply) end
-            return
+    local layoutCount = net.ReadUInt(16)
+    if layoutCount > maxBoneCount then return end
+    local layoutBones, layoutPositions = {}, {}
+    for i = 1, layoutCount do
+        layoutBones[i] = net.ReadUInt(16)
+        layoutPositions[i] = net.ReadBool()
+    end
+    local layoutFlexCount = net.ReadUInt(16)
+    if layoutFlexCount > maxFlexCount then return end
+    local layoutFlexes = {}
+    for i = 1, layoutFlexCount do
+        layoutFlexes[i] = net.ReadInt(16)
+    end
+
+    local frames = {}
+    for n = 1, resultCount do
+        local bones, flexes = {}, {}
+        if net.ReadBool() then
+            for i = 1, layoutCount do
+                local ang = net.ReadAngle()
+                local x, y, z = 0, 0, 0
+                if layoutPositions[i] then
+                    x = finite_number(net.ReadFloat())
+                    y = finite_number(net.ReadFloat())
+                    z = finite_number(net.ReadFloat())
+                end
+                bones[i] = { layoutBones[i], finite_number(ang.p), finite_number(ang.y), finite_number(ang.r), x, y, z }
+            end
+            for i = 1, layoutFlexCount do
+                flexes[i] = { layoutFlexes[i], math.Clamp(finite_number(net.ReadFloat()), 0, 1) }
+            end
+        else
+            local boneCount = net.ReadUInt(16)
+            if boneCount > maxBoneCount then return end
+            for i = 1, boneCount do
+                local bone = net.ReadUInt(16)
+                local ang = net.ReadAngle()
+                local x = finite_number(net.ReadFloat())
+                local y = finite_number(net.ReadFloat())
+                local z = finite_number(net.ReadFloat())
+                bones[i] = { bone, finite_number(ang.p), finite_number(ang.y), finite_number(ang.r), x, y, z }
+            end
+            local flexCount = net.ReadUInt(16)
+            if flexCount > maxFlexCount then return end
+            for i = 1, flexCount do
+                local flexID = net.ReadInt(16)
+                flexes[i] = { flexID, math.Clamp(finite_number(net.ReadFloat()), 0, 1) }
+            end
         end
+        frames[n] = { frame = firstFrame + n - 1, bones = bones, flexes = flexes }
+    end
 
-        local frameData = {
-            frame = frame,
-            bones = {},
-            flexes = {},
-        }
-        for _ = 1, boneCount do
-            local bone = net.ReadUInt(16)
-            local ang = net.ReadAngle()
-            local pos = Vector(finite_number(net.ReadFloat()), finite_number(net.ReadFloat()), finite_number(net.ReadFloat()))
-            frameData.bones[#frameData.bones + 1] = { bone, finite_number(ang.p), finite_number(ang.y), finite_number(ang.r), pos.x, pos.y, pos.z }
+    local chunk = {}
+    for n, frameData in ipairs(frames) do
+        job.frames[#job.frames + 1] = frameData
+        chunk[n] = encode_built_frame(frameData)
+        for _, b in ipairs(frameData.bones) do
+            local bone = b[1]
             if not job.bones[bone] then
                 job.bones[bone] = job.ent.GetBoneName and (job.ent:GetBoneName(bone) or "") or ""
             end
         end
-
-        local flexCount = math.Clamp(net.ReadUInt(16), 0, maxFlexCount)
-        for _ = 1, flexCount do
-            local flexID = net.ReadInt(16)
-            local weight = math.Clamp(finite_number(net.ReadFloat()), 0, 1)
-            frameData.flexes[#frameData.flexes + 1] = { flexID, weight }
+        for _, f in ipairs(frameData.flexes) do
+            local flexID = f[1]
             if flexID >= 0 and not job.flexes[flexID] then
                 job.flexes[flexID] = job.ent.GetFlexName and (job.ent:GetFlexName(flexID) or "") or ""
             end
         end
-
-        job.frames[#job.frames + 1] = frameData
-        expectedFrame = expectedFrame + 1
     end
+    job.jsonChunks = job.jsonChunks or {}
+    job.jsonChunks[#job.jsonChunks + 1] = table.concat(chunk, ",")
 
-    job.currentFrame = expectedFrame
+    job.currentFrame = firstFrame + resultCount
+    local inflight = job.inflight or {}
+    while inflight[1] and inflight[1].first + inflight[1].count <= job.currentFrame do
+        table.remove(inflight, 1)
+    end
+    if inflight[1] and inflight[1].first < job.currentFrame then
+        inflight[1].count = inflight[1].first + inflight[1].count - job.currentFrame
+        inflight[1].first = job.currentFrame
+    end
     job.buildRetries = 0
+    job.lastRequestAt = CurTime()
     if job.currentFrame > job.endFrame then
         finalize_build(ply, job)
     else
-        send_build_progress(ply, "building", job, string.format("built through frame %d / %d", expectedFrame - 1, job.endFrame))
-        send_build_frame_request(ply, job)
+        send_build_progress(ply, "building", job, string.format("built through frame %d / %d", job.currentFrame - 1, job.endFrame))
+        pump_build_requests(ply, job)
     end
 end)
 

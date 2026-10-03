@@ -170,7 +170,26 @@ function MMDVMDNPC.SaveFlexOverrides()
     )
 end
 
-function MMDVMDNPC.FlexOverrideForModel(modelPath, sourceName, mmdName)
+-- A saved mapping is one model flex name (a plain string, the original
+-- format) or a list of them when one morph drives several flexes.
+local function override_flex_names(value)
+    if istable(value) then
+        local names = {}
+        for _, name in ipairs(value) do
+            name = tostring(name or "")
+            if name ~= "" then names[#names + 1] = name end
+        end
+        return #names > 0 and names or nil
+    end
+    if value == nil then return nil end
+    value = tostring(value)
+    if value == "" then return nil end
+    return { value }
+end
+
+-- Every model flex name saved for this morph (or the unassigned sentinel), or
+-- nil when it has no manual mapping.
+function MMDVMDNPC.FlexOverrideTargetsForModel(modelPath, sourceName, mmdName)
     local modelKey = flex_override_model_key(modelPath)
     if modelKey == "" then return nil end
 
@@ -182,9 +201,7 @@ function MMDVMDNPC.FlexOverrideForModel(modelPath, sourceName, mmdName)
 
     local function lookup(map, key)
         if not istable(map) or key == "" then return nil end
-        local value = map[key]
-        if value ~= nil and tostring(value) ~= "" then return tostring(value) end
-        return nil
+        return override_flex_names(map[key])
     end
 
     return lookup(modelOverrides.by_mmd, mmdName)
@@ -193,13 +210,26 @@ function MMDVMDNPC.FlexOverrideForModel(modelPath, sourceName, mmdName)
         or lookup(modelOverrides.by_source_norm, normalize_flex_name(sourceName))
 end
 
-function MMDVMDNPC.SetFlexOverrideForModel(modelPath, mmdName, sourceName, flexName)
+function MMDVMDNPC.FlexOverrideForModel(modelPath, sourceName, mmdName)
+    local names = MMDVMDNPC.FlexOverrideTargetsForModel(modelPath, sourceName, mmdName)
+    return names and names[1] or nil
+end
+
+-- flexNames: one model flex name or a list of them.
+function MMDVMDNPC.SetFlexOverrideForModel(modelPath, mmdName, sourceName, flexNames)
     local modelKey = flex_override_model_key(modelPath)
-    flexName = tostring(flexName or "")
+    local names = override_flex_names(flexNames)
     mmdName = tostring(mmdName or "")
     sourceName = tostring(sourceName or "")
 
-    if modelKey == "" or flexName == "" then return false end
+    if modelKey == "" or not names then return false end
+    -- One flex stays a plain string so older addon versions still read it.
+    local function stored()
+        if #names == 1 then return names[1] end
+        local copy = {}
+        for i, name in ipairs(names) do copy[i] = name end
+        return copy
+    end
 
     local overrides = MMDVMDNPC.LoadFlexOverrides()
     local modelOverrides = overrides[modelKey] or {}
@@ -209,12 +239,12 @@ function MMDVMDNPC.SetFlexOverrideForModel(modelPath, mmdName, sourceName, flexN
     modelOverrides.by_source_norm = istable(modelOverrides.by_source_norm) and modelOverrides.by_source_norm or {}
 
     if mmdName ~= "" then
-        modelOverrides.by_mmd[mmdName] = flexName
-        modelOverrides.by_mmd_norm[normalize_flex_name(mmdName)] = flexName
+        modelOverrides.by_mmd[mmdName] = stored()
+        modelOverrides.by_mmd_norm[normalize_flex_name(mmdName)] = stored()
     end
     if sourceName ~= "" then
-        modelOverrides.by_source[sourceName] = flexName
-        modelOverrides.by_source_norm[normalize_flex_name(sourceName)] = flexName
+        modelOverrides.by_source[sourceName] = stored()
+        modelOverrides.by_source_norm[normalize_flex_name(sourceName)] = stored()
     end
 
     overrides[modelKey] = modelOverrides
@@ -299,9 +329,26 @@ function MMDVMDNPC.LoadFlexAliases()
     return aliases
 end
 
-function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName)
-    if not IsValid(ent) then return -1, "" end
+-- One pass over an entity's flex names: exact, lowercase and normalized name
+-- -> first flex id carrying it. Resolving every track of a motion against one
+-- index replaces a GetFlexName scan per candidate name per track.
+function MMDVMDNPC.BuildFlexIndex(ent)
+    local index = { exact = {}, lower = {}, normalized = {}, names = {} }
+    if not IsValid(ent) or not ent.GetFlexNum or not ent.GetFlexName then return index end
 
+    for flexID = 0, (ent:GetFlexNum() or 0) - 1 do
+        local name = tostring(ent:GetFlexName(flexID) or "")
+        index.names[flexID] = name
+        if index.exact[name] == nil then index.exact[name] = flexID end
+        local lower = string.lower(name)
+        if index.lower[lower] == nil then index.lower[lower] = flexID end
+        local normalized = normalize_flex_name(name)
+        if normalized ~= "" and index.normalized[normalized] == nil then index.normalized[normalized] = flexID end
+    end
+    return index
+end
+
+local function flex_name_candidates(sourceName, mmdName)
     local candidates = {}
     local seen = {}
     local function add_candidate(name)
@@ -313,54 +360,125 @@ function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName)
         end
     end
 
-    if ent.GetModel and MMDVMDNPC.FlexOverrideForModel then
-        local override = MMDVMDNPC.FlexOverrideForModel(ent:GetModel() or "", sourceName, mmdName)
-        if override == FLEX_OVERRIDE_UNASSIGNED then return -1, "" end
-        add_candidate(override)
-    end
     add_candidate(sourceName)
     add_candidate(mmdName)
-    local aliases = MMDVMDNPC.LoadFlexAliases()[tostring(sourceName or "")] or {}
-    for _, alias in ipairs(aliases) do
+    local aliases = MMDVMDNPC.LoadFlexAliases()
+    for _, alias in ipairs(aliases[sourceName] or {}) do
         add_candidate(alias)
     end
-    aliases = MMDVMDNPC.LoadFlexAliases()[tostring(mmdName or "")] or {}
-    for _, alias in ipairs(aliases) do
+    for _, alias in ipairs(aliases[mmdName] or {}) do
         add_candidate(alias)
     end
+    return candidates
+end
 
+-- Best single flex for the candidate names, in priority order: an exact (then
+-- case-insensitive) name, then the engine's name lookup, then the lowest flex
+-- id whose normalized name matches any candidate.
+local function resolve_flex_candidates(ent, index, candidates)
     for _, name in ipairs(candidates) do
-        local exactID, exactName = exact_flex_on_entity(ent, name)
-        if exactID and exactID >= 0 then
-            return exactID, exactName or name
-        end
+        local flexID = index.exact[name] or index.lower[string.lower(name)]
+        if flexID ~= nil then return flexID end
     end
 
     if ent.GetFlexIDByName then
         for _, name in ipairs(candidates) do
             local flexID = ent:GetFlexIDByName(name)
-            if flexID and flexID >= 0 then
-                local actualName = ent.GetFlexName and ent:GetFlexName(flexID) or nil
-                return flexID, actualName or name
-            end
+            if flexID and flexID >= 0 then return flexID end
         end
     end
 
-    local normalizedCandidates = {}
+    local best
     for _, name in ipairs(candidates) do
-        normalizedCandidates[normalize_flex_name(name)] = true
+        local flexID = index.normalized[normalize_flex_name(name)]
+        if flexID ~= nil and (best == nil or flexID < best) then best = flexID end
     end
+    return best
+end
 
-    if ent.GetFlexNum and ent.GetFlexName then
-        for flexID = 0, (ent:GetFlexNum() or 0) - 1 do
-            local flexName = ent:GetFlexName(flexID)
-            if normalizedCandidates[normalize_flex_name(flexName)] then
-                return flexID, flexName or ""
+-- Sides a model may split a combined controller into ("eye_blink_happy" ->
+-- "eye_blink_happy_left" + "eye_blink_happy_right"), compared normalized.
+local FLEX_SIDE_SUFFIXES = {
+    { "left", "right" },
+    { "l", "r" },
+    { "左", "右" },
+}
+
+local function resolve_flex_sides(index, candidates)
+    for _, name in ipairs(candidates) do
+        local base = normalize_flex_name(name)
+        if base ~= "" then
+            for _, sides in ipairs(FLEX_SIDE_SUFFIXES) do
+                local left = index.normalized[base .. sides[1]]
+                local right = index.normalized[base .. sides[2]]
+                if left ~= nil and right ~= nil and left ~= right then
+                    return left, right
+                end
             end
         end
     end
+    return nil, nil
+end
 
-    return -1, ""
+-- Every model flex a motion flex track drives, as a list of { id, name }:
+-- the manual mapping (one or more flexes) when it resolves on this model, else
+-- the single best name match, else both one-sided halves of a combined
+-- controller the model lacks. Empty when unresolved or unassigned.
+-- index: optional MMDVMDNPC.BuildFlexIndex(ent) shared across tracks.
+function MMDVMDNPC.ResolveFlexTargets(ent, sourceName, mmdName, index)
+    if not IsValid(ent) then return {} end
+    index = index or MMDVMDNPC.BuildFlexIndex(ent)
+    sourceName = tostring(sourceName or "")
+    mmdName = tostring(mmdName or "")
+
+    local targets, seen = {}, {}
+    local function add_target(flexID)
+        if flexID ~= nil and flexID >= 0 and not seen[flexID] then
+            seen[flexID] = true
+            local name = index.names[flexID]
+            if name == nil and ent.GetFlexName then name = tostring(ent:GetFlexName(flexID) or "") end
+            targets[#targets + 1] = { id = flexID, name = name or "" }
+        end
+    end
+
+    local override = ent.GetModel and MMDVMDNPC.FlexOverrideTargetsForModel(ent:GetModel() or "", sourceName, mmdName) or nil
+    if override then
+        for _, name in ipairs(override) do
+            if name == FLEX_OVERRIDE_UNASSIGNED then return {} end
+        end
+        for _, name in ipairs(override) do
+            add_target(resolve_flex_candidates(ent, index, { name }))
+        end
+        if #targets > 0 then return targets end
+    end
+
+    local candidates = flex_name_candidates(sourceName, mmdName)
+    local flexID = resolve_flex_candidates(ent, index, candidates)
+    if flexID ~= nil then
+        add_target(flexID)
+        return targets
+    end
+
+    local left, right = resolve_flex_sides(index, candidates)
+    add_target(left)
+    add_target(right)
+    return targets
+end
+
+-- First resolved flex (kept for callers that expect a single flex).
+function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName, index)
+    local target = MMDVMDNPC.ResolveFlexTargets(ent, sourceName, mmdName, index)[1]
+    if not target then return -1, "" end
+    return target.id, target.name
+end
+
+-- Display text for a track's targets ("a" or "a + b").
+function MMDVMDNPC.FlexTargetsLabel(targets)
+    local names = {}
+    for i, target in ipairs(targets or {}) do
+        names[i] = tostring(target.name or "")
+    end
+    return table.concat(names, " + ")
 end
 
 -- Optional MMD camera track exported by the importer: entity-local eye

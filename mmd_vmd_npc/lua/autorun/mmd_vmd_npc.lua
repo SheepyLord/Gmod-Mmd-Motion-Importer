@@ -31,7 +31,6 @@ if SERVER then
     util.AddNetworkString("mmdvmd_build_begin")
     util.AddNetworkString("mmdvmd_build_plan")
     util.AddNetworkString("mmdvmd_build_compact_request")
-    util.AddNetworkString("mmdvmd_build_frame_request")
     util.AddNetworkString("mmdvmd_build_frame_result")
     util.AddNetworkString("mmdvmd_build_done")
     util.AddNetworkString("mmdvmd_build_progress")

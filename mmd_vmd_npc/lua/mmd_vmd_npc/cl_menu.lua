@@ -709,6 +709,24 @@ end
 
 local ZERO_VECTOR = Vector(0, 0, 0)
 local ZERO_ANGLE = Angle(0, 0, 0)
+-- Reused engine objects: ManipulateBone*/net.WriteAngle copy their argument,
+-- so one scratch object replaces a fresh allocation per call.
+local scratch_angle, scratch_vector
+do
+    local angleMeta = FindMetaTable and FindMetaTable("Angle") or nil
+    local vectorMeta = FindMetaTable and FindMetaTable("Vector") or nil
+    local setAngle = angleMeta and angleMeta.SetUnpacked or function(a, p, y, r) a.p, a.y, a.r = p, y, r end
+    local setVector = vectorMeta and vectorMeta.SetUnpacked or function(v, x, y, z) v.x, v.y, v.z = x, y, z end
+    local angle, vector = Angle(0, 0, 0), Vector(0, 0, 0)
+    scratch_angle = function(p, y, r)
+        setAngle(angle, p, y, r)
+        return angle
+    end
+    scratch_vector = function(x, y, z)
+        setVector(vector, x, y, z)
+        return vector
+    end
+end
 local SOURCE_PELVIS = "ValveBiped.Bip01_Pelvis"
 local SOURCE_SPINE = "ValveBiped.Bip01_Spine"
 local LOCAL_PLAYBACK_HZ = 120
@@ -993,20 +1011,31 @@ local function source_is_eye(source)
     return string.find(source, "eye", 1, true) ~= nil
 end
 
-local function transforms_disabled_for_source(source)
-    if convar_bool("mmd_vmd_npc_disable_armtwist", false) and source_is_arm_twist(source) then
+-- options: a build job's option snapshot (sent with the build plan). Without
+-- it the live convars apply (debug preview).
+local function transforms_disabled_for_source(source, options)
+    local armTwist, handTwist, eyes
+    if options then
+        armTwist, handTwist, eyes = options.disableArmTwist == true, options.disableHandTwist == true, options.disableEyes == true
+    else
+        armTwist = convar_bool("mmd_vmd_npc_disable_armtwist", false)
+        handTwist = convar_bool("mmd_vmd_npc_disable_handtwist", false)
+        eyes = convar_bool("mmd_vmd_npc_disable_eyes", false)
+    end
+    if armTwist and source_is_arm_twist(source) then
         return true
     end
-    if convar_bool("mmd_vmd_npc_disable_handtwist", false) and source_is_hand_twist(source) then
+    if handTwist and source_is_hand_twist(source) then
         return true
     end
-    if convar_bool("mmd_vmd_npc_disable_eyes", false) and source_is_eye(source) then
+    if eyes and source_is_eye(source) then
         return true
     end
     return false
 end
 
-local function spine_pelvis_correction_enabled()
+local function spine_pelvis_correction_enabled(options)
+    if options then return options.disableSpinePelvisCorrection ~= true end
     return not convar_bool("mmd_vmd_npc_disable_spine_pelvis_correction", false)
 end
 
@@ -1299,11 +1328,6 @@ local function build_dummy_for_model(model, target)
     return dummy
 end
 
-local function build_dummy_for_target(target)
-    if not IsValid(target) then return nil end
-    return build_dummy_for_model(target:GetModel() or "", target)
-end
-
 local function clear_local_playback_pose(ent, built)
     if not IsValid(ent) or not built then return end
 
@@ -1343,32 +1367,35 @@ local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOf
     pelvisZOffset = tonumber(pelvisZOffset) or 0
     local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
     local rootMotion = root_motion_origin_active()
+    -- Runs every frame per dancing entity: look the methods up once and pass
+    -- the reused scratch objects (the engine copies them).
+    local manipulateAngles = ent.ManipulateBoneAngles
+    local manipulatePosition = ent.ManipulateBonePosition
+    local bonesB = frameB.bones or {}
 
     for index, boneA in ipairs(frameA.bones or {}) do
-        local boneB = (frameB.bones or {})[index] or boneA
+        local boneB = bonesB[index] or boneA
         local bone = tonumber(boneA[1]) or -1
         if bone >= 0 then
-            if ent.ManipulateBoneAngles then
-                ent:ManipulateBoneAngles(bone, Angle(
+            if manipulateAngles then
+                manipulateAngles(ent, bone, scratch_angle(
                     lerp_angle_value(boneA[2], boneB[2], fraction),
                     lerp_angle_value(boneA[3], boneB[3], fraction),
                     lerp_angle_value(boneA[4], boneB[4], fraction)
                 ), false)
             end
-            if ent.ManipulateBonePosition then
-                local pos = Vector(
-                    lerp_value(boneA[5], boneB[5], fraction),
-                    lerp_value(boneA[6], boneB[6], fraction),
-                    lerp_value(boneA[7], boneB[7], fraction)
-                )
+            if manipulatePosition then
+                local x = lerp_value(boneA[5], boneB[5], fraction)
+                local y = lerp_value(boneA[6], boneB[6], fraction)
+                local z = lerp_value(boneA[7], boneB[7], fraction)
                 if pelvisBone and bone == pelvisBone then
-                    pos.z = pos.z + pelvisZOffset
+                    z = z + pelvisZOffset
                     if rootMotion then
-                        pos.x = 0
-                        pos.y = 0
+                        x = 0
+                        y = 0
                     end
                 end
-                ent:ManipulateBonePosition(bone, pos)
+                manipulatePosition(ent, bone, scratch_vector(x, y, z))
             end
         end
     end
@@ -2372,28 +2399,41 @@ local FLEX_MOUTH_PATTERNS = {
     "mouth", "lip", "lips", "jaw", "tongue", "teeth",
 }
 
-local function flex_category_scale(row)
-    local text = flex_row_text(row)
-    if text_has_any(text, FLEX_MOUTH_PATTERNS) then
-        return convar_float("mmd_vmd_npc_flex_scale_mouth", 1), "mouth"
-    end
-    if text_has_any(text, FLEX_BROW_PATTERNS) then
-        return convar_float("mmd_vmd_npc_flex_scale_brow", 1), "brow"
-    end
-    if text_has_any(text, FLEX_EYE_PATTERNS) then
-        return convar_float("mmd_vmd_npc_flex_scale_eye", 1), "eye"
-    end
-    return 1, "other"
+-- One read of the flex scale convars. A build job snapshots this once so every
+-- frame of the build uses the same scales.
+local function current_flex_scales()
+    return {
+        all = convar_float("mmd_vmd_npc_flex_scale_all", 1),
+        mouth = convar_float("mmd_vmd_npc_flex_scale_mouth", 1),
+        brow = convar_float("mmd_vmd_npc_flex_scale_brow", 1),
+        eye = convar_float("mmd_vmd_npc_flex_scale_eye", 1),
+        other = 1,
+    }
 end
 
-local function flex_scale_for_row(row)
-    local allScale = convar_float("mmd_vmd_npc_flex_scale_all", 1)
-    local categoryScale, category = flex_category_scale(row)
+local function flex_category_scale(row, scales)
+    local text = flex_row_text(row)
+    local category = "other"
+    if text_has_any(text, FLEX_MOUTH_PATTERNS) then
+        category = "mouth"
+    elseif text_has_any(text, FLEX_BROW_PATTERNS) then
+        category = "brow"
+    elseif text_has_any(text, FLEX_EYE_PATTERNS) then
+        category = "eye"
+    end
+    if category == "other" then return 1, category end
+    if scales then return scales[category] or 1, category end
+    return convar_float("mmd_vmd_npc_flex_scale_" .. category, 1), category
+end
+
+local function flex_scale_for_row(row, scales)
+    local allScale = scales and scales.all or convar_float("mmd_vmd_npc_flex_scale_all", 1)
+    local categoryScale, category = flex_category_scale(row, scales)
     return allScale * categoryScale, category
 end
 
-local function scaled_flex_weight(row)
-    local scale, category = flex_scale_for_row(row)
+local function scaled_flex_weight(row, scales)
+    local scale, category = flex_scale_for_row(row, scales)
     local raw = tonumber(row and row.weight) or 0
     if row then
         row.flexScale = scale
@@ -2401,6 +2441,13 @@ local function scaled_flex_weight(row)
         row.scaledWeight = math.Clamp(raw * scale, 0, 1)
     end
     return math.Clamp(raw * scale, 0, 1)
+end
+
+-- Model flexes a motion flex row drives (several when a split or manual
+-- mapping assigns more than one).
+local function flex_row_ids(row)
+    if row.flexIDs then return row.flexIDs end
+    return { tonumber(row.flexID) or -1 }
 end
 
 -- Fast build path -----------------------------------------------------------
@@ -2414,250 +2461,635 @@ end
 -- bone. Every frame is verified against the engine result; on any mismatch the
 -- job permanently falls back to the legacy path, so output is always
 -- equivalent to the legacy build within FAST_BUILD_VERIFY_EPSILON degrees.
+--
+-- Everything that is constant for a job (bone lookups, traversal order, rest
+-- orientations, option checks, flex scales) is compiled once, and a frame is
+-- solved on plain numbers. Each engine Vector/Angle/VMatrix and every
+-- LocalToWorld/WorldToLocal is a C call plus a userdata allocation; the solver
+-- used to make thousands of them per frame. The scalar helpers reproduce
+-- mathlib's AngleMatrix / MatrixAngles / VectorAngles, including the Angle
+-- round trips the object version took between steps, so results match it.
 local FAST_BUILD_VERIFY_EPSILON = 0.5
 
 local function fast_build_enabled()
     return convar_bool("mmd_vmd_npc_fast_build", true)
 end
 
-local function angle_error_degrees(a, b)
-    local dot = math.min(a:Forward():Dot(b:Forward()), a:Up():Dot(b:Up()))
-    return math.deg(math.acos(math.Clamp(dot, -1, 1)))
-end
+-- (Helpers are scoped in do-blocks: this file's main chunk is near Lua's
+-- 200-local limit.)
+local fast_compile_solver, fast_solve_frame
+do
+    local DEG_TO_RAD = math.pi / 180
+    local RAD_TO_DEG = 180 / math.pi
+    local m_sin, m_cos, m_atan2, m_sqrt, m_acos = math.sin, math.cos, math.atan2, math.sqrt, math.acos
 
-local function fast_skeleton_for_dummy(job, dummy)
-    local model = dummy:GetModel() or ""
-    local cache = job.fastSkeleton
-    if cache and cache.ent == dummy and cache.model == model then return cache end
-
-    local refOk, referenceInfo = force_reference_pose(dummy)
-    referenceInfo = referenceInfo or lookup_reference_sequence_info(dummy)
-    clear_all_bone_manipulations(dummy)
-
-    cache = {
-        ent = dummy,
-        model = model,
-        referenceInfo = referenceInfo,
-        restLocal = {},
-        bySource = {},
-        -- Only measure a skeleton that is provably AT its reference pose; a
-        -- failed reference pose would measure some mid-animation pose and
-        -- could false-trigger on an A-pose model.
-        armCorrections = refOk and arm_reference_corrections(dummy) or nil,
-    }
-    if cache.armCorrections then
-        for _, correction in pairs(cache.armCorrections) do
-            print(string.format("[MMD VMD] Non-standard reference arm pose on %s: re-inclining %s by %.1f° to the standard A-pose.",
-                model, correction.boneName or "upper arm", correction.degrees))
-        end
+    -- Row-major 3x3 rotation; columns are forward, left, up (mathlib AngleMatrix).
+    local function set_angle_matrix(m, p, y, r)
+        p, y, r = p * DEG_TO_RAD, y * DEG_TO_RAD, r * DEG_TO_RAD
+        local sp, cp = m_sin(p), m_cos(p)
+        local sy, cy = m_sin(y), m_cos(y)
+        local sr, cr = m_sin(r), m_cos(r)
+        m[1] = cp * cy
+        m[2] = sr * sp * cy - cr * sy
+        m[3] = cr * sp * cy + sr * sy
+        m[4] = cp * sy
+        m[5] = sr * sp * sy + cr * cy
+        m[6] = cr * sp * sy - sr * cy
+        m[7] = -sp
+        m[8] = sr * cp
+        m[9] = cr * cp
+        return m
     end
 
-    local captureAng = dummy:GetAngles()
-    local boneCount = dummy.GetBoneCount and dummy:GetBoneCount() or 0
-    for bone = 0, boneCount - 1 do
-        local matrix = dummy.GetBoneMatrix and dummy:GetBoneMatrix(bone) or nil
+    -- mathlib MatrixAngles from the forward column (m1, m4, m7), the left column
+    -- (m2, m5, m8) and up.z (m9).
+    local function matrix_angles(m1, m2, m4, m5, m7, m8, m9)
+        local xy = m_sqrt(m1 * m1 + m4 * m4)
+        if xy > 0.001 then
+            return m_atan2(-m7, xy) * RAD_TO_DEG, m_atan2(m4, m1) * RAD_TO_DEG, m_atan2(m8, m9) * RAD_TO_DEG
+        end
+        return m_atan2(-m7, xy) * RAD_TO_DEG, m_atan2(-m2, m5) * RAD_TO_DEG, 0
+    end
+
+    -- One component of clean_angle.
+    local function clean_degrees(value)
+        value = (value + 180) % 360 - 180
+        if value < 0.00001 and value > -0.00001 then return 0 end
+        return value
+    end
+
+    local function angle_object_matrix(ang)
+        return set_angle_matrix({}, ang.p or 0, ang.y or 0, ang.r or 0)
+    end
+
+    local VMATRIX_META = FindMetaTable and FindMetaTable("VMatrix") or nil
+    local vmatrix_unpack = VMATRIX_META and VMATRIX_META.Unpack or nil
+
+    -- VMatrix:Unpack returns the 16 entries row by row: forward column 1/5/9, left
+    -- 2/6/10, up 3/7/11, translation 4/8/12. Checked once against the per-axis
+    -- getters so a different layout can only cost speed, never correctness.
+    local vmatrixUnpackOK = nil
+
+    local function calibrate_vmatrix_unpack(matrix)
+        vmatrixUnpackOK = false
+        if not vmatrix_unpack or not matrix.GetForward or not matrix.GetUp or not matrix.GetTranslation then return end
+        local e11, _, e13, e14, e21, _, e23, e24, e31, _, e33, e34 = vmatrix_unpack(matrix)
+        local f, u, t = matrix:GetForward(), matrix:GetUp(), matrix:GetTranslation()
+        local function near(a, b) return type(a) == "number" and math.abs(a - b) <= 0.0001 end
+        vmatrixUnpackOK = near(e11, f.x) and near(e21, f.y) and near(e31, f.z)
+            and near(e13, u.x) and near(e23, u.y) and near(e33, u.z)
+            and near(e14, t.x) and near(e24, t.y) and near(e34, t.z)
+    end
+
+    -- Returns the forward column, left column, up.z and translation of a bone's
+    -- world matrix, or nil when the engine has no matrix for it.
+    local function read_bone_matrix(ent, bone)
+        local matrix = ent:GetBoneMatrix(bone)
+        if not matrix then return nil end
+        if vmatrixUnpackOK == nil then calibrate_vmatrix_unpack(matrix) end
+        if vmatrixUnpackOK then
+            local e11, e12, _, e14, e21, e22, _, e24, e31, e32, e33, e34 = vmatrix_unpack(matrix)
+            return e11, e12, e21, e22, e31, e32, e33, e14, e24, e34
+        end
+        local f, u, t = matrix:GetForward(), matrix:GetUp(), matrix:GetTranslation()
+        local fx, fy, fz, ux, uy, uz = f.x, f.y, f.z, u.x, u.y, u.z
+        -- left = up x forward (orthonormal basis), so no reliance on GetRight's sign.
+        return fx, uy * fz - uz * fy, fy, uz * fx - ux * fz, fz, ux * fy - uy * fx, uz, t.x, t.y, t.z
+    end
+
+    local function bone_translation(ent, bone)
+        local matrix = ent.GetBoneMatrix and ent:GetBoneMatrix(bone) or nil
         if matrix then
-            local _, localAng = WorldToLocal(ZERO_VECTOR, matrix:GetAngles(), ZERO_VECTOR, captureAng)
-            cache.restLocal[bone] = localAng
+            local t = matrix:GetTranslation()
+            return t.x, t.y, t.z
         end
+        if ent.GetBonePosition then
+            local pos = ent:GetBonePosition(bone)
+            if pos then return pos.x, pos.y, pos.z end
+        end
+        return 0, 0, 0
     end
 
-    cache.pelvisBone = dummy.LookupBone and dummy:LookupBone(SOURCE_PELVIS) or nil
-    cache.spineBone = dummy.LookupBone and dummy:LookupBone(SOURCE_SPINE) or nil
-    if cache.pelvisBone and cache.spineBone then
-        cache.referenceSpineVector = bone_world_position(dummy, cache.spineBone) - bone_world_position(dummy, cache.pelvisBone)
+    local function fast_solver_unsafe(job)
+        job.fastUnsafe = true
+        job.fastSolver = nil
+        return nil
     end
 
-    job.fastSkeleton = cache
-    return cache
-end
+    -- Captures the dummy's reference skeleton and compiles everything a frame
+    -- needs. Returns nil (and marks the job for the legacy path) when the closed
+    -- form cannot represent this skeleton.
+    fast_compile_solver = function(job, dummy)
+        local model = dummy:GetModel() or ""
+        local refOk, referenceInfo = force_reference_pose(dummy)
+        referenceInfo = referenceInfo or lookup_reference_sequence_info(dummy)
+        clear_all_bone_manipulations(dummy)
+        dummy.MMDVMDNPCManipOwner = nil
 
-local function fast_annotate_rows(cache, dummy, rows)
-    local bySource = cache.bySource
-    for index, row in ipairs(rows) do
-        local source = row.source or ""
-        local info = bySource[source]
-        if info == nil then
-            local bone = dummy.LookupBone and dummy:LookupBone(source) or nil
-            info = {
-                bone = bone or false,
-                depth = bone and bone_depth(dummy, bone) or 999999,
+        -- Only measure a skeleton that is provably AT its reference pose; a
+        -- failed reference pose would measure some mid-animation pose and could
+        -- false-trigger on an A-pose model.
+        local armCorrections = refOk and arm_reference_corrections(dummy) or nil
+        if armCorrections then
+            for _, correction in pairs(armCorrections) do
+                print(string.format("[MMD VMD] Non-standard reference arm pose on %s: re-inclining %s by %.1f° to the standard A-pose.",
+                    model, correction.boneName or "upper arm", correction.degrees))
+            end
+        end
+
+        local restLocal = {}
+        local captureAng = dummy:GetAngles()
+        local boneCount = dummy.GetBoneCount and dummy:GetBoneCount() or 0
+        for bone = 0, boneCount - 1 do
+            local matrix = dummy.GetBoneMatrix and dummy:GetBoneMatrix(bone) or nil
+            if matrix then
+                local _, localAng = WorldToLocal(ZERO_VECTOR, matrix:GetAngles(), ZERO_VECTOR, captureAng)
+                restLocal[bone] = localAng
+            end
+        end
+
+        local solver = {
+            ent = dummy,
+            model = model,
+            idlenoise = reference_basis_is_idlenoise(referenceInfo),
+            rows = {},
+            verifyBones = {},
+            flexRows = {},
+            cur = {},
+            seen = {},
+            stamp = 0,
+            base = {},
+            corrected = {},
+            check = {},
+            entMatrix = {},
+            appliedAng = {},
+            appliedPos = {},
+            bonesByID = {},
+            flexesByID = {},
+        }
+
+        local pelvisBone = dummy.LookupBone and dummy:LookupBone(SOURCE_PELVIS) or nil
+        local spineBone = dummy.LookupBone and dummy:LookupBone(SOURCE_SPINE) or nil
+        if pelvisBone and spineBone then
+            local sx, sy, sz = bone_translation(dummy, spineBone)
+            local px, py, pz = bone_translation(dummy, pelvisBone)
+            solver.refSpineX, solver.refSpineY, solver.refSpineZ = sx - px, sy - py, sz - pz
+            solver.spineCorrection = spine_pelvis_correction_enabled(job.options) and dummy.ManipulateBonePosition ~= nil
+        end
+        solver.pelvisBone, solver.spineBone = pelvisBone, spineBone
+
+        local bySource = {}
+        local rows = {}
+        for index, track in ipairs(job.boneTracks or {}) do
+            local source = track.source or ""
+            local info = bySource[source]
+            if info == nil then
+                local bone = dummy.LookupBone and dummy:LookupBone(source) or nil
+                info = {
+                    bone = bone or false,
+                    depth = bone and bone_depth(dummy, bone) or 999999,
+                }
+                bySource[source] = info
+            end
+            rows[index] = {
+                index = index,
+                offset = (index - 1) * 6,
+                source = source,
+                mmd = track.mmd or "",
+                role = track.role or "",
+                bone = info.bone or nil,
+                depth = info.depth,
+                resolved = info.bone ~= false and info.bone ~= nil,
             }
-            bySource[source] = info
         end
-        row.index = index
-        row.bone = info.bone or nil
-        row.depth = info.depth
-        row.resolved = info.bone ~= false and info.bone ~= nil
-        row.p = 0
-        row.localYaw = 0
-        row.r = 0
-    end
 
-    if not cache.ancByBone then
+        -- Parents before children: the same traversal order the legacy path uses.
+        table.sort(rows, function(a, b)
+            if a.resolved ~= b.resolved then return a.resolved end
+            if a.depth ~= b.depth then return a.depth < b.depth end
+            if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
+            return (a.index or 0) < (b.index or 0)
+        end)
+
         local tracked = {}
         for _, row in ipairs(rows) do
             if row.resolved then tracked[row.bone] = true end
         end
 
-        local ancByBone = {}
-        local relByBone = {}
-        for bone in pairs(tracked) do
-            if not cache.restLocal[bone] then return false end
-            local parent = dummy.GetBoneParent and dummy:GetBoneParent(bone) or -1
-            local guard = 0
-            while parent and parent >= 0 and guard < 512 do
-                if tracked[parent] then break end
-                parent = dummy:GetBoneParent(parent)
-                guard = guard + 1
-            end
-            if parent and parent >= 0 and tracked[parent] then
-                if not cache.restLocal[parent] then return false end
-                ancByBone[bone] = parent
-                local _, rel = WorldToLocal(ZERO_VECTOR, cache.restLocal[bone], ZERO_VECTOR, cache.restLocal[parent])
-                relByBone[bone] = rel
-            end
-        end
-        cache.ancByBone = ancByBone
-        cache.relByBone = relByBone
-    end
+        for _, row in ipairs(rows) do
+            if row.resolved then
+                local bone = row.bone
+                local rest = restLocal[bone]
+                if not rest then return fast_solver_unsafe(job) end
 
-    for _, row in ipairs(rows) do
-        if row.resolved and not cache.restLocal[row.bone] then return false end
-    end
-    return true
-end
-
-local function fast_build_frame(job, dummy, rows, flexRows)
-    local cache = fast_skeleton_for_dummy(job, dummy)
-    if not cache then return nil end
-    if not fast_annotate_rows(cache, dummy, rows) then
-        job.fastUnsafe = true
-        return nil
-    end
-
-    table.sort(rows, function(a, b)
-        if a.resolved ~= b.resolved then return a.resolved end
-        if a.depth ~= b.depth then return a.depth < b.depth end
-        if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
-        return (a.index or 0) < (b.index or 0)
-    end)
-
-    local referenceInfo = cache.referenceInfo
-    local entAngles = dummy:GetAngles()
-    local packed = {}
-    local packedByBone = {}
-    local appliedAngles = {}
-    local appliedPositions = {}
-    local curWorld = {}
-    local function remember_packet(bone, ang, pos)
-        local packet = packedByBone[bone]
-        if not packet then
-            packet = { bone = bone, ang = ZERO_ANGLE, pos = ZERO_VECTOR }
-            packedByBone[bone] = packet
-            packed[#packed + 1] = packet
-        end
-        packet.ang = clean_angle(ang or ZERO_ANGLE)
-        packet.pos = copy_vector(pos or ZERO_VECTOR)
-    end
-
-    for _, row in ipairs(rows) do
-        if row.resolved then
-            local bone = row.bone
-            local anc = cache.ancByBone[bone]
-            local baseline
-            if anc ~= nil and curWorld[anc] then
-                local _, out = LocalToWorld(ZERO_VECTOR, cache.relByBone[bone], ZERO_VECTOR, curWorld[anc])
-                baseline = out
-            else
-                local _, out = LocalToWorld(ZERO_VECTOR, cache.restLocal[bone], ZERO_VECTOR, entAngles)
-                baseline = out
-            end
-
-            row.disabled = transforms_disabled_for_source(row.source)
-            if row.disabled then
-                curWorld[bone] = baseline
-                if dummy.ManipulateBonePosition then dummy:ManipulateBonePosition(bone, ZERO_VECTOR) end
-                if dummy.ManipulateBoneAngles then dummy:ManipulateBoneAngles(bone, ZERO_ANGLE, false) end
-            else
-                local degrees = raw_axis_to_model_axis_degrees(row.x, row.y, row.z, referenceInfo)
-                local position = transform_reference_vector_to_sequence_basis(Vector(row.px or 0, row.py or 0, row.pz or 0), referenceInfo)
-                if spine_pelvis_correction_enabled() and row_uses_runtime_spine_position(row) then
-                    position = Vector(0, 0, 0)
-                    row.runtimePosition = true
+                local parent = dummy.GetBoneParent and dummy:GetBoneParent(bone) or -1
+                local guard = 0
+                while parent and parent >= 0 and guard < 512 do
+                    if tracked[parent] then break end
+                    parent = dummy:GetBoneParent(parent)
+                    guard = guard + 1
                 end
+                if parent and parent >= 0 and tracked[parent] then
+                    if not restLocal[parent] then return fast_solver_unsafe(job) end
+                    local _, rel = WorldToLocal(ZERO_VECTOR, rest, ZERO_VECTOR, restLocal[parent])
+                    row.anc = parent
+                    row.rel = angle_object_matrix(rel)
+                end
+                row.rest = angle_object_matrix(rest)
+
+                row.disabled = transforms_disabled_for_source(row.source, job.options)
+                row.runtimeSpine = spine_pelvis_correction_enabled(job.options) and row_uses_runtime_spine_position(row)
+                local correction = armCorrections and armCorrections[bone] or nil
+                if correction then row.arm = angle_object_matrix(correction.localDelta) end
+
+                if not solver.cur[bone] then
+                    solver.cur[bone] = {}
+                    solver.verifyBones[#solver.verifyBones + 1] = bone
+                end
+                solver.rows[#solver.rows + 1] = row
+                solver.bonesByID[bone] = {
+                    id = bone,
+                    name = row.source,
+                    source = row.source,
+                    mmd = row.mmd,
+                    role = row.role,
+                }
+            end
+        end
+
+        -- Same packets as merged_flex_packets: every model flex gets one slot
+        -- (first-use order) that sums the tracks driving it.
+        local flexBase = #(job.boneTracks or {}) * 6
+        local slotByFlex = {}
+        solver.flexTargets, solver.flexSums = {}, {}
+        for index, track in ipairs(job.flexTracks or {}) do
+            if track.resolved then
+                local scale = flex_scale_for_row({
+                    mmd = track.mmd,
+                    source = track.source,
+                    resolvedName = track.resolvedName,
+                }, job.flexScales)
+                local slots = {}
+                for t, flexID in ipairs(flex_row_ids(track)) do
+                    if flexID and flexID >= 0 then
+                        local slot = slotByFlex[flexID]
+                        if not slot then
+                            slot = #solver.flexTargets + 1
+                            slotByFlex[flexID] = slot
+                            solver.flexTargets[slot] = flexID
+                        end
+                        slots[#slots + 1] = slot
+                        local name = track.flexNames and track.flexNames[t] or track.resolvedName or ""
+                        solver.flexesByID[flexID] = {
+                            id = flexID,
+                            name = name,
+                            source = track.source or "",
+                            mmd = track.mmd or "",
+                            resolved = name,
+                        }
+                    end
+                end
+                if #slots > 0 then
+                    solver.flexRows[#solver.flexRows + 1] = {
+                        offset = flexBase + index,
+                        scale = scale,
+                        slots = slots,
+                    }
+                end
+            end
+        end
+
+        -- jigglebones are leaf chains (hair, cloth) that never feed a tracked bone,
+        -- but SetupBones simulates every one of them on every call. Playback
+        -- force-disables jiggle anyway (sv_commands disable_all_bone_jiggle).
+        if dummy.ManipulateBoneJiggle then
+            for bone = 0, boneCount - 1 do
+                dummy:ManipulateBoneJiggle(bone, 2)
+            end
+        end
+
+        job.fastSolver = solver
+        return solver
+    end
+
+    -- Skips the engine call when the bone already holds this manipulation.
+    local function fast_apply_manipulation(solver, dummy, bone, p, y, r, x, yy, z)
+        local pos = solver.appliedPos[bone]
+        if not pos or pos[1] ~= x or pos[2] ~= yy or pos[3] ~= z then
+            dummy:ManipulateBonePosition(bone, scratch_vector(x, yy, z))
+            if pos then
+                pos[1], pos[2], pos[3] = x, yy, z
+            else
+                solver.appliedPos[bone] = { x, yy, z }
+            end
+        end
+        local ang = solver.appliedAng[bone]
+        if not ang or ang[1] ~= p or ang[2] ~= y or ang[3] ~= r then
+            dummy:ManipulateBoneAngles(bone, scratch_angle(p, y, r), false)
+            if ang then
+                ang[1], ang[2], ang[3] = p, y, r
+            else
+                solver.appliedAng[bone] = { p, y, r }
+            end
+        end
+    end
+
+    -- values: one frame's sampled tracks (6 per bone track: x, y, z, px, py, pz,
+    -- then one weight per flex track). Returns the frame in built-cache form, or
+    -- nil when the engine disagrees with the closed form.
+    fast_solve_frame = function(job, solver, dummy, values, frameNumber)
+        if dummy.MMDVMDNPCManipOwner ~= solver then
+            -- Something else posed the dummy since this solver last ran; forget
+            -- what we think it holds so every manipulation is re-sent.
+            solver.appliedAng, solver.appliedPos = {}, {}
+            dummy.MMDVMDNPCManipOwner = solver
+        end
+
+        local entAng = dummy:GetAngles()
+        local E = set_angle_matrix(solver.entMatrix, entAng.p or 0, entAng.y or 0, entAng.r or 0)
+        local e1, e2, e3, e4, e5, e6, e7, e8, e9 = E[1], E[2], E[3], E[4], E[5], E[6], E[7], E[8], E[9]
+        -- Model axes: X = Forward (column 1), Y = Right (minus column 2), Z = Up.
+        local xx, xy, xz = e1, e4, e7
+        local yx, yy, yz = -e2, -e5, -e8
+        local zx, zy, zz = e3, e6, e9
+
+        local idlenoise = solver.idlenoise
+        local cur, seen = solver.cur, solver.seen
+        local base, corrected = solver.base, solver.corrected
+        local stamp = solver.stamp + 1
+        solver.stamp = stamp
+
+        local pelvisBone = solver.pelvisBone
+        local pelvisPacket, pelvisMp, pelvisMy, pelvisMr
+        local bones, packetByBone = {}, {}
+        local rows = solver.rows
+
+        for i = 1, #rows do
+            local row = rows[i]
+            local bone = row.bone
+
+            -- Baseline: rest orientation re-parented through the nearest tracked
+            -- ancestor solved this frame (else through the entity).
+            local P, R
+            local anc = row.anc
+            if anc ~= nil and seen[anc] == stamp then
+                P, R = cur[anc], row.rel
+            else
+                P, R = E, row.rest
+            end
+            local p1, p2, p3, p4, p5, p6, p7, p8, p9 = P[1], P[2], P[3], P[4], P[5], P[6], P[7], P[8], P[9]
+            local r1, r2, r3, r4, r5, r6, r7, r8, r9 = R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8], R[9]
+            local bp, byw, br = matrix_angles(
+                p1 * r1 + p2 * r4 + p3 * r7, p1 * r2 + p2 * r5 + p3 * r8,
+                p4 * r1 + p5 * r4 + p6 * r7, p4 * r2 + p5 * r5 + p6 * r8,
+                p7 * r1 + p8 * r4 + p9 * r7, p7 * r2 + p8 * r5 + p9 * r8,
+                p7 * r3 + p8 * r6 + p9 * r9)
+            set_angle_matrix(base, bp, byw, br)
+
+            local D = cur[bone]
+            seen[bone] = stamp
+            if row.disabled then
+                for k = 1, 9 do D[k] = base[k] end
+            else
+                local o = row.offset
+                local dx, dy, dz = -values[o + 2], -values[o + 1], values[o + 3]
+                local px, py, pz = values[o + 4], values[o + 5], values[o + 6]
+                if idlenoise then
+                    dx, dy = -dy, dx
+                    px, py = -py, px
+                end
+                if row.runtimeSpine then px, py, pz = 0, 0, 0 end
 
                 -- Desired composes on the (possibly T-pose-corrected) baseline;
                 -- the manip stays a delta against the REAL baseline, so the
                 -- engine lands exactly on desired and self-verification holds.
-                -- Descendants inherit the correction via curWorld.
-                local correction = cache.armCorrections and cache.armCorrections[bone] or nil
-                local desired = rotate_angle_around_sequential_model_axes(
-                    arm_corrected_baseline(baseline, correction), entAngles, degrees)
-                local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
-                local manip = clean_angle(localManip)
-                curWorld[bone] = desired
+                local B = base
+                local L = row.arm
+                if L then
+                    local cp, cy, cr = matrix_angles(
+                        base[1] * L[1] + base[2] * L[4] + base[3] * L[7], base[1] * L[2] + base[2] * L[5] + base[3] * L[8],
+                        base[4] * L[1] + base[5] * L[4] + base[6] * L[7], base[4] * L[2] + base[5] * L[5] + base[6] * L[8],
+                        base[7] * L[1] + base[8] * L[4] + base[9] * L[7], base[7] * L[2] + base[8] * L[5] + base[9] * L[8],
+                        base[7] * L[3] + base[8] * L[6] + base[9] * L[9])
+                    B = set_angle_matrix(corrected, cp, cy, cr)
+                end
 
-                row.p = manip.p or 0
-                row.localYaw = manip.y or 0
-                row.r = manip.r or 0
-                appliedAngles[bone] = manip
-                appliedPositions[bone] = position
-                remember_packet(bone, manip, position)
+                -- rotate_angle_around_sequential_model_axes: forward and up
+                -- rotated about the model Y, then X, then Z axis (Rodrigues).
+                local fx, fy, fz = B[1], B[4], B[7]
+                local ux, uy, uz = B[3], B[6], B[9]
+                if dy >= 0.00001 or dy <= -0.00001 then
+                    local c, s = m_cos(dy * DEG_TO_RAD), m_sin(dy * DEG_TO_RAD)
+                    local t = 1 - c
+                    local d = (yx * fx + yy * fy + yz * fz) * t
+                    fx, fy, fz = fx * c + (yy * fz - yz * fy) * s + yx * d, fy * c + (yz * fx - yx * fz) * s + yy * d, fz * c + (yx * fy - yy * fx) * s + yz * d
+                    d = (yx * ux + yy * uy + yz * uz) * t
+                    ux, uy, uz = ux * c + (yy * uz - yz * uy) * s + yx * d, uy * c + (yz * ux - yx * uz) * s + yy * d, uz * c + (yx * uy - yy * ux) * s + yz * d
+                end
+                if dx >= 0.00001 or dx <= -0.00001 then
+                    local c, s = m_cos(dx * DEG_TO_RAD), m_sin(dx * DEG_TO_RAD)
+                    local t = 1 - c
+                    local d = (xx * fx + xy * fy + xz * fz) * t
+                    fx, fy, fz = fx * c + (xy * fz - xz * fy) * s + xx * d, fy * c + (xz * fx - xx * fz) * s + xy * d, fz * c + (xx * fy - xy * fx) * s + xz * d
+                    d = (xx * ux + xy * uy + xz * uz) * t
+                    ux, uy, uz = ux * c + (xy * uz - xz * uy) * s + xx * d, uy * c + (xz * ux - xx * uz) * s + xy * d, uz * c + (xx * uy - xy * ux) * s + xz * d
+                end
+                if dz >= 0.00001 or dz <= -0.00001 then
+                    local c, s = m_cos(dz * DEG_TO_RAD), m_sin(dz * DEG_TO_RAD)
+                    local t = 1 - c
+                    local d = (zx * fx + zy * fy + zz * fz) * t
+                    fx, fy, fz = fx * c + (zy * fz - zz * fy) * s + zx * d, fy * c + (zz * fx - zx * fz) * s + zy * d, fz * c + (zx * fy - zy * fx) * s + zz * d
+                    d = (zx * ux + zy * uy + zz * uz) * t
+                    ux, uy, uz = ux * c + (zy * uz - zz * uy) * s + zx * d, uy * c + (zz * ux - zx * uz) * s + zy * d, uz * c + (zx * uy - zy * ux) * s + zz * d
+                end
+                local len = m_sqrt(fx * fx + fy * fy + fz * fz)
+                if len > 0 then fx, fy, fz = fx / len, fy / len, fz / len end
+                len = m_sqrt(ux * ux + uy * uy + uz * uz)
+                if len > 0 then ux, uy, uz = ux / len, uy / len, uz / len end
 
-                if dummy.ManipulateBonePosition then dummy:ManipulateBonePosition(bone, position) end
-                if dummy.ManipulateBoneAngles then dummy:ManipulateBoneAngles(bone, manip, false) end
+                -- forward:AngleEx(up) (mathlib VectorAngles with a pseudo-up).
+                local lx, ly, lz = uy * fz - uz * fy, uz * fx - ux * fz, ux * fy - uy * fx
+                len = m_sqrt(lx * lx + ly * ly + lz * lz)
+                if len > 0 then lx, ly, lz = lx / len, ly / len, lz / len end
+                local xyDist = m_sqrt(fx * fx + fy * fy)
+                local dp, dyw, dr
+                if xyDist > 0.001 then
+                    dp = m_atan2(-fz, xyDist) * RAD_TO_DEG
+                    dyw = m_atan2(fy, fx) * RAD_TO_DEG
+                    dr = m_atan2(lz, ly * fx - lx * fy) * RAD_TO_DEG
+                else
+                    dp = m_atan2(-fz, xyDist) * RAD_TO_DEG
+                    dyw = m_atan2(-lx, ly) * RAD_TO_DEG
+                    dr = 0
+                end
+                set_angle_matrix(D, clean_degrees(dp), clean_degrees(dyw), clean_degrees(dr))
+
+                -- Manipulation = baseline^-1 * desired (WorldToLocal).
+                local mp, my, mr = matrix_angles(
+                    base[1] * D[1] + base[4] * D[4] + base[7] * D[7], base[1] * D[2] + base[4] * D[5] + base[7] * D[8],
+                    base[2] * D[1] + base[5] * D[4] + base[8] * D[7], base[2] * D[2] + base[5] * D[5] + base[8] * D[8],
+                    base[3] * D[1] + base[6] * D[4] + base[9] * D[7], base[3] * D[2] + base[6] * D[5] + base[9] * D[8],
+                    base[3] * D[3] + base[6] * D[6] + base[9] * D[9])
+                mp, my, mr = clean_degrees(mp), clean_degrees(my), clean_degrees(mr)
+
+                local packet = packetByBone[bone]
+                if not packet then
+                    packet = { bone, 0, 0, 0, 0, 0, 0 }
+                    packetByBone[bone] = packet
+                    bones[#bones + 1] = packet
+                end
+                packet[2], packet[3], packet[4] = clean_degrees(mp), clean_degrees(my), clean_degrees(mr)
+                packet[5], packet[6], packet[7] = px, py, pz
+                if bone == pelvisBone then
+                    pelvisPacket, pelvisMp, pelvisMy, pelvisMr = packet, mp, my, mr
+                end
+                row.mp, row.my, row.mr, row.px, row.py, row.pz = mp, my, mr, px, py, pz
+            end
+        end
+
+        -- Engine calls only after the closed-form pass: C functions abort LuaJIT
+        -- traces, so keeping them out of the loop above lets it compile. The solve
+        -- never reads engine state, so deferring the manipulations changes nothing.
+        for i = 1, #rows do
+            local row = rows[i]
+            if row.disabled then
+                fast_apply_manipulation(solver, dummy, row.bone, 0, 0, 0, 0, 0, 0)
+            else
+                fast_apply_manipulation(solver, dummy, row.bone, row.mp, row.my, row.mr, row.px, row.py, row.pz)
+            end
+        end
+
+        setup_bones_now(dummy)
+
+        -- Self-verification: each solved bone's engine orientation (through the
+        -- same GetAngles() round trip as before) against the closed form.
+        local check = solver.check
+        local spineBone = solver.spineBone
+        local minDot = 2
+        local spineX, spineY, spineZ, pelvisX, pelvisY, pelvisZ
+        local verifyBones = solver.verifyBones
+        for i = 1, #verifyBones do
+            local bone = verifyBones[i]
+            local m1, m2, m4, m5, m7, m8, m9, tx, ty, tz = read_bone_matrix(dummy, bone)
+            if m1 then
+                local ap, ay, ar = matrix_angles(m1, m2, m4, m5, m7, m8, m9)
+                set_angle_matrix(check, ap, ay, ar)
+                local D = cur[bone]
+                local fdot = check[1] * D[1] + check[4] * D[4] + check[7] * D[7]
+                local udot = check[3] * D[3] + check[6] * D[6] + check[9] * D[9]
+                local dot = fdot < udot and fdot or udot
+                if dot < minDot then minDot = dot end
+                if bone == spineBone then spineX, spineY, spineZ = tx, ty, tz end
+                if bone == pelvisBone then pelvisX, pelvisY, pelvisZ = tx, ty, tz end
+            end
+        end
+        local maxError = 0
+        if minDot < 1 then
+            maxError = m_acos(minDot < -1 and -1 or minDot) * RAD_TO_DEG
+        end
+        if maxError > FAST_BUILD_VERIFY_EPSILON then
+            job.fastUnsafe = true
+            print(string.format(
+                "[MMD VMD] fast build verification failed on %s (%.3f deg deviation); falling back to the legacy build path for this job",
+                solver.model, maxError
+            ))
+            return nil
+        end
+
+        if solver.spineCorrection then
+            if spineX == nil then spineX, spineY, spineZ = bone_translation(dummy, spineBone) end
+            if pelvisX == nil then pelvisX, pelvisY, pelvisZ = bone_translation(dummy, pelvisBone) end
+            local cwx = ((spineX - pelvisX) - solver.refSpineX) * -0.5
+            local cwy = ((spineY - pelvisY) - solver.refSpineY) * -0.5
+            local cwz = ((spineZ - pelvisZ) - solver.refSpineZ) * -0.5
+            if cwx * cwx + cwy * cwy + cwz * cwz > 0.0000001 then
+                -- World vector into the entity's frame (world_vector_to_entity_local).
+                local nx = e1 * cwx + e4 * cwy + e7 * cwz
+                local ny = e2 * cwx + e5 * cwy + e8 * cwz
+                local nz = e3 * cwx + e6 * cwy + e9 * cwz
+                local ap, ay, ar = 0, 0, 0
+                if pelvisPacket then
+                    nx, ny, nz = pelvisPacket[5] + nx, pelvisPacket[6] + ny, pelvisPacket[7] + nz
+                    ap, ay, ar = pelvisMp, pelvisMy, pelvisMr
+                else
+                    pelvisPacket = { pelvisBone, 0, 0, 0, 0, 0, 0 }
+                    packetByBone[pelvisBone] = pelvisPacket
+                    bones[#bones + 1] = pelvisPacket
+                end
+                pelvisPacket[2], pelvisPacket[3], pelvisPacket[4] = clean_degrees(ap), clean_degrees(ay), clean_degrees(ar)
+                pelvisPacket[5], pelvisPacket[6], pelvisPacket[7] = nx, ny, nz
+
+                local pos = solver.appliedPos[pelvisBone]
+                if not pos or pos[1] ~= nx or pos[2] ~= ny or pos[3] ~= nz then
+                    dummy:ManipulateBonePosition(pelvisBone, scratch_vector(nx, ny, nz))
+                    solver.appliedPos[pelvisBone] = { nx, ny, nz }
+                end
+            end
+        end
+
+        local flexTargets, sums = solver.flexTargets, solver.flexSums
+        for i = 1, #flexTargets do sums[i] = nil end
+        local flexRows = solver.flexRows
+        for i = 1, #flexRows do
+            local flex = flexRows[i]
+            local weight = (values[flex.offset] or 0) * flex.scale
+            if weight < 0 then weight = 0 elseif weight > 1 then weight = 1 end
+            local slots = flex.slots
+            for k = 1, #slots do
+                local slot = slots[k]
+                local sum = sums[slot]
+                sums[slot] = sum and (sum + weight) or weight
+            end
+        end
+        local flexes = {}
+        for i = 1, #flexTargets do
+            flexes[i] = { flexTargets[i], math.min(sums[i], 1) }
+        end
+
+        return {
+            frame = math.max(0, math.floor(tonumber(frameNumber) or 0)),
+            bones = bones,
+            flexes = flexes,
+        }
+    end
+end
+
+-- One frame's flex packets: each resolved row's scaled weight goes to every
+-- model flex it drives. Rows that drive the same flex add up (MMD morphs are
+-- additive) and are clamped to the flex range, in first-use order. Before, a
+-- second row on the same flex simply overwrote the first — a wink's zero
+-- erased a smile on the shared eyelid.
+local function merged_flex_packets(flexRows, flexScales)
+    local order, sums = {}, {}
+    for _, row in ipairs(flexRows or {}) do
+        local weight = scaled_flex_weight(row, flexScales)
+        if row.resolved then
+            for _, flexID in ipairs(flex_row_ids(row)) do
+                if flexID and flexID >= 0 then
+                    if sums[flexID] == nil then
+                        order[#order + 1] = flexID
+                        sums[flexID] = weight
+                    else
+                        sums[flexID] = sums[flexID] + weight
+                    end
+                end
             end
         end
     end
 
-    setup_bones_now(dummy)
-
-    local maxError = 0
-    for bone, desired in pairs(curWorld) do
-        local matrix = dummy.GetBoneMatrix and dummy:GetBoneMatrix(bone) or nil
-        if matrix then
-            local err = angle_error_degrees(matrix:GetAngles(), desired)
-            if err > maxError then maxError = err end
-        end
+    local packed = {}
+    for i, flexID in ipairs(order) do
+        packed[i] = {
+            flexID = flexID,
+            weight = math.min(sums[flexID], 1),
+        }
     end
-    if maxError > FAST_BUILD_VERIFY_EPSILON then
-        job.fastUnsafe = true
-        print(string.format(
-            "[MMD VMD] fast build verification failed on %s (%.3f deg deviation); falling back to the legacy build path for this job",
-            cache.model, maxError
-        ))
-        return nil
-    end
-
-    if spine_pelvis_correction_enabled() and cache.pelvisBone and cache.spineBone and cache.referenceSpineVector and dummy.ManipulateBonePosition then
-        local frameSpineVector = bone_world_position(dummy, cache.spineBone) - bone_world_position(dummy, cache.pelvisBone)
-        local correctionWorld = (frameSpineVector - cache.referenceSpineVector) * -0.5
-        if not is_zero_vector(correctionWorld) then
-            local correctionLocal = world_vector_to_entity_local(dummy, correctionWorld)
-            local pelvisPosition = copy_vector(appliedPositions[cache.pelvisBone]) + correctionLocal
-            local pelvisAngle = appliedAngles[cache.pelvisBone] or ZERO_ANGLE
-
-            dummy:ManipulateBonePosition(cache.pelvisBone, pelvisPosition)
-            remember_packet(cache.pelvisBone, pelvisAngle, pelvisPosition)
-        end
-    end
-
-    local flexPacked = {}
-    for _, row in ipairs(flexRows or {}) do
-        local weight = scaled_flex_weight(row)
-        if row.resolved and row.flexID and row.flexID >= 0 then
-            flexPacked[#flexPacked + 1] = {
-                flexID = row.flexID,
-                weight = weight,
-            }
-        end
-    end
-
-    return packed, flexPacked
+    return packed
 end
 
-local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServer, targetOverride)
+-- buildOptions/flexScales: a build job's snapshots (legacy build fallback);
+-- nil uses the live convars (debug preview).
+local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServer, targetOverride, buildOptions, flexScales)
     local target = targetOverride or (targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil)
     if not IsValid(target) or not target.GetBoneCount then
         for _, row in ipairs(rows) do
@@ -2719,7 +3151,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
 
     for _, row in ipairs(rows) do
         if row.resolved then
-            row.disabled = transforms_disabled_for_source(row.source)
+            row.disabled = transforms_disabled_for_source(row.source, buildOptions)
             if row.disabled then
                 row.p = 0
                 row.localYaw = 0
@@ -2727,7 +3159,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
             else
                 local degrees = raw_axis_to_model_axis_degrees(row.x, row.y, row.z, referenceInfo)
                 local position = transform_reference_vector_to_sequence_basis(Vector(row.px or 0, row.py or 0, row.pz or 0), referenceInfo)
-                if spine_pelvis_correction_enabled() and row_uses_runtime_spine_position(row) then
+                if spine_pelvis_correction_enabled(buildOptions) and row_uses_runtime_spine_position(row) then
                     position = Vector(0, 0, 0)
                     row.runtimePosition = true
                 end
@@ -2757,7 +3189,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
         end
     end
 
-    if spine_pelvis_correction_enabled() and pelvisBone and spineBone and referenceSpineVector and target.ManipulateBonePosition then
+    if spine_pelvis_correction_enabled(buildOptions) and pelvisBone and spineBone and referenceSpineVector and target.ManipulateBonePosition then
         setup_bones_now(target)
 
         local frameSpineVector = bone_world_position(target, spineBone) - bone_world_position(target, pelvisBone)
@@ -2777,16 +3209,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
         end
     end
 
-    local flexPacked = {}
-    for _, row in ipairs(flexRows or {}) do
-        local weight = scaled_flex_weight(row)
-        if row.resolved and row.flexID and row.flexID >= 0 then
-            flexPacked[#flexPacked + 1] = {
-                flexID = row.flexID,
-                weight = weight,
-            }
-        end
-    end
+    local flexPacked = merged_flex_packets(flexRows, flexScales)
 
     if sendToServer ~= false then
         send_debug_pose(target, packed, flexPacked)
@@ -2794,12 +3217,96 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
     return packed, flexPacked
 end
 
-local function compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
-    if job and IsValid(dummy) and not job.fastUnsafe and fast_build_enabled() then
-        local packed, flexPacked = fast_build_frame(job, dummy, rows, flexRows)
-        if packed then return packed, flexPacked end
+local compute_build_frame
+do
+    -- Sampled build values back into the row tables the legacy path consumes.
+    local function legacy_build_rows(job, values)
+        local boneTracks = job.boneTracks or {}
+        local rows = {}
+        for index, track in ipairs(boneTracks) do
+            local o = (index - 1) * 6
+            rows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                role = track.role,
+                x = values[o + 1],
+                y = values[o + 2],
+                z = values[o + 3],
+                px = values[o + 4],
+                py = values[o + 5],
+                pz = values[o + 6],
+                resolved = track.resolved,
+                bone = track.bone,
+            }
+        end
+
+        local flexBase = #boneTracks * 6
+        local flexRows = {}
+        for index, track in ipairs(job.flexTracks or {}) do
+            flexRows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                resolvedName = track.resolvedName,
+                weight = values[flexBase + index],
+                flexID = track.flexID,
+                flexIDs = track.flexIDs,
+                flexNames = track.flexNames,
+                resolved = track.resolved,
+            }
+        end
+        return rows, flexRows
     end
-    return rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
+
+    -- One build frame in built-cache form ({frame, bones, flexes}).
+    compute_build_frame = function(job, dummy, values, frameNumber, targetEntIndex)
+        if not job.fastUnsafe and fast_build_enabled() then
+            local solver = job.fastSolver
+            if not solver or solver.ent ~= dummy or solver.model ~= (dummy:GetModel() or "") then
+                solver = fast_compile_solver(job, dummy)
+            end
+            local frame = solver and fast_solve_frame(job, solver, dummy, values, frameNumber)
+            if frame then
+                if job.metadataSolver ~= solver then
+                    job.metadataSolver = solver
+                    for id, meta in pairs(solver.bonesByID) do job.bonesByID[id] = meta end
+                    for id, meta in pairs(solver.flexesByID) do job.flexesByID[id] = meta end
+                end
+                return frame
+            end
+        end
+
+        local rows, flexRows = legacy_build_rows(job, values)
+        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy, job.options, job.flexScales)
+        dummy.MMDVMDNPCManipOwner = nil
+        for _, row in ipairs(rows) do
+            if row.resolved and row.bone then
+                job.bonesByID[row.bone] = {
+                    id = row.bone,
+                    name = row.source or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    role = row.role or "",
+                }
+            end
+        end
+        for _, row in ipairs(flexRows) do
+            if row.resolved then
+                for t, flexID in ipairs(flex_row_ids(row)) do
+                    if flexID and flexID >= 0 then
+                        local name = row.flexNames and row.flexNames[t] or row.resolvedName or ""
+                        job.flexesByID[flexID] = {
+                            id = flexID,
+                            name = name,
+                            source = row.source or "",
+                            mmd = row.mmd or "",
+                            resolved = name,
+                        }
+                    end
+                end
+            end
+        end
+        return packet_to_frame_data(frameNumber, packed, flexPacked)
+    end
 end
 
 local function debug_flex_choice_label(row, index)
@@ -2816,6 +3323,24 @@ local function selected_debug_flex_row(frame)
     if not IsValid(frame) or not IsValid(frame.UnresolvedMorphCombo) then return nil end
     local key = frame.UnresolvedMorphCombo:GetValue()
     return frame.UnresolvedFlexChoices and frame.UnresolvedFlexChoices[key] or nil
+end
+
+-- "name #id" for every model flex a motion flex row drives.
+local function flex_targets_text(row)
+    if not row or not row.resolved then return "" end
+    local parts = {}
+    for t, flexID in ipairs(flex_row_ids(row)) do
+        local name = row.flexNames and row.flexNames[t] or row.resolvedName or ""
+        parts[#parts + 1] = tostring(name) .. " #" .. tostring(flexID)
+    end
+    return table.concat(parts, " + ")
+end
+
+local function update_flex_targets_label(frame)
+    if not IsValid(frame) or not IsValid(frame.FlexTargetsLabel) then return end
+    local row = selected_debug_flex_row(frame)
+    local text = row and row.targetsText or ""
+    frame.FlexTargetsLabel:SetText(text ~= "" and LF("mmd_vmd_npc.debug.flex_targets_fmt", text) or L("mmd_vmd_npc.debug.flex_targets_none"))
 end
 
 local function selected_debug_model_flex(frame)
@@ -2850,6 +3375,7 @@ local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
             resolved = row.resolved == true,
             resolvedName = tostring(row.resolvedName or ""),
             flexID = tonumber(row.flexID) or -1,
+            targetsText = flex_targets_text(row),
         }
         firstMotionFlex = firstMotionFlex or label
     end
@@ -2888,9 +3414,12 @@ local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
 
     local canAssign = firstMotionFlex ~= nil and firstFlex ~= nil and targetEntIndex and targetEntIndex > 0
     if IsValid(frame.AssignFlexOverride) then frame.AssignFlexOverride:SetEnabled(canAssign) end
+    if IsValid(frame.AddFlexOverride) then frame.AddFlexOverride:SetEnabled(canAssign) end
+    if IsValid(frame.RemoveFlexOverride) then frame.RemoveFlexOverride:SetEnabled(canAssign) end
     local canChangeMapping = firstMotionFlex ~= nil and targetEntIndex and targetEntIndex > 0
     if IsValid(frame.UnassignFlexOverride) then frame.UnassignFlexOverride:SetEnabled(canChangeMapping) end
     if IsValid(frame.ClearFlexOverride) then frame.ClearFlexOverride:SetEnabled(canChangeMapping) end
+    update_flex_targets_label(frame)
 end
 
 local function request_flex_override(frame, mode)
@@ -2902,8 +3431,11 @@ local function request_flex_override(frame, mode)
     local ent = frame.TargetEntIndex and Entity(frame.TargetEntIndex) or nil
     if not IsValid(ent) then return end
 
-    local flexName = mode == "save" and selected_debug_model_flex(frame) or ""
-    if mode == "save" and (not flexName or flexName == "") then return end
+    -- save = drive only the selected flex; add/remove edit the set of flexes
+    -- the morph drives.
+    local editsFlexList = mode == "save" or mode == "add" or mode == "remove"
+    local flexName = editsFlexList and selected_debug_model_flex(frame) or ""
+    if editsFlexList and (not flexName or flexName == "") then return end
 
     local message = "mmdvmd_flex_override_save"
     if mode == "clear" then
@@ -2917,8 +3449,9 @@ local function request_flex_override(frame, mode)
         net.WriteString(tostring(frame.MotionID or ""))
         net.WriteString(tostring(row.mmd or ""))
         net.WriteString(tostring(row.source or ""))
-        if mode == "save" then
+        if editsFlexList then
             net.WriteString(tostring(flexName or ""))
+            net.WriteString(mode == "save" and "set" or mode)
         end
     net.SendToServer()
 
@@ -3295,6 +3828,7 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
             for label, row in pairs(frame.UnresolvedFlexChoices or {}) do
                 if row.mmd == mmd and row.source == source then
                     frame.UnresolvedMorphCombo:SetValue(label)
+                    update_flex_targets_label(frame)
                     return
                 end
             end
@@ -3302,61 +3836,64 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
 
         local flexOverride = vgui.Create("DPanel", frame)
         flexOverride:Dock(BOTTOM)
-        flexOverride:SetTall(58)
+        flexOverride:SetTall(84)
 
         frame.FlexOverrideTitle = vgui.Create("DLabel", flexOverride)
         frame.FlexOverrideTitle:Dock(TOP)
         frame.FlexOverrideTitle:SetTall(20)
         frame.FlexOverrideTitle:SetText(L("mmd_vmd_npc.debug.flex_mapping"))
 
+        -- Morph picker on a fixed left slot, model flex picker filling the
+        -- rest; the action buttons get their own row so five of them still fit
+        -- a narrow (800px) debug window.
         local flexOverrideRow = vgui.Create("DPanel", flexOverride)
-        flexOverrideRow:Dock(FILL)
+        flexOverrideRow:Dock(TOP)
+        flexOverrideRow:SetTall(26)
 
-        -- Responsive layout: the morph combo takes a fixed left slot, the three
-        -- action buttons dock right, and the model combo fills the remainder, so
-        -- the row never sums past a narrow (800px) debug window and clips the
-        -- Clear button off-screen.
         frame.UnresolvedMorphCombo = vgui.Create("DComboBox", flexOverrideRow)
         frame.UnresolvedMorphCombo:Dock(LEFT)
         frame.UnresolvedMorphCombo:SetZPos(1)
-        frame.UnresolvedMorphCombo:SetWide(200)
+        frame.UnresolvedMorphCombo:SetWide(260)
         frame.UnresolvedMorphCombo:SetTooltip(L("mmd_vmd_npc.debug.motion_flex"))
-
-        frame.AssignFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.AssignFlexOverride:Dock(RIGHT)
-        frame.AssignFlexOverride:SetZPos(2)
-        frame.AssignFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.AssignFlexOverride:SetWide(110)
-        frame.AssignFlexOverride:SetText(L("mmd_vmd_npc.debug.assign_flex"))
-        frame.AssignFlexOverride.DoClick = function()
-            request_flex_override(frame, "save")
-        end
-
-        frame.UnassignFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.UnassignFlexOverride:Dock(RIGHT)
-        frame.UnassignFlexOverride:SetZPos(3)
-        frame.UnassignFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.UnassignFlexOverride:SetWide(110)
-        frame.UnassignFlexOverride:SetText(L("mmd_vmd_npc.debug.unassign_flex"))
-        frame.UnassignFlexOverride.DoClick = function()
-            request_flex_override(frame, "unassign")
-        end
-
-        frame.ClearFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.ClearFlexOverride:Dock(RIGHT)
-        frame.ClearFlexOverride:SetZPos(4)
-        frame.ClearFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.ClearFlexOverride:SetWide(110)
-        frame.ClearFlexOverride:SetText(L("mmd_vmd_npc.debug.clear_flex_mapping"))
-        frame.ClearFlexOverride.DoClick = function()
-            request_flex_override(frame, "clear")
+        frame.UnresolvedMorphCombo.OnSelect = function()
+            update_flex_targets_label(frame)
         end
 
         frame.ModelFlexCombo = vgui.Create("DComboBox", flexOverrideRow)
         frame.ModelFlexCombo:Dock(FILL)
         frame.ModelFlexCombo:SetZPos(100)
-        frame.ModelFlexCombo:DockMargin(6, 0, 6, 0)
+        frame.ModelFlexCombo:DockMargin(6, 0, 0, 0)
         frame.ModelFlexCombo:SetTooltip(L("mmd_vmd_npc.debug.model_flex"))
+
+        local flexOverrideButtons = vgui.Create("DPanel", flexOverride)
+        flexOverrideButtons:Dock(FILL)
+        flexOverrideButtons:DockMargin(0, 4, 0, 0)
+
+        local function add_mapping_button(labelKey, tooltipKey, mode)
+            local button = vgui.Create("DButton", flexOverrideButtons)
+            button:Dock(LEFT)
+            button:DockMargin(0, 0, 6, 0)
+            button:SetText(L(labelKey))
+            button:SizeToContentsX(20)
+            button:SetWide(math.max(90, button:GetWide()))
+            if tooltipKey then button:SetTooltip(L(tooltipKey)) end
+            button.DoClick = function()
+                request_flex_override(frame, mode)
+            end
+            return button
+        end
+
+        frame.AssignFlexOverride = add_mapping_button("mmd_vmd_npc.debug.assign_flex", "mmd_vmd_npc.debug.assign_flex_tip", "save")
+        frame.AddFlexOverride = add_mapping_button("mmd_vmd_npc.debug.add_flex", "mmd_vmd_npc.debug.add_flex_tip", "add")
+        frame.RemoveFlexOverride = add_mapping_button("mmd_vmd_npc.debug.remove_flex", "mmd_vmd_npc.debug.remove_flex_tip", "remove")
+        frame.UnassignFlexOverride = add_mapping_button("mmd_vmd_npc.debug.unassign_flex", nil, "unassign")
+        frame.ClearFlexOverride = add_mapping_button("mmd_vmd_npc.debug.clear_flex_mapping", nil, "clear")
+
+        -- Every model flex the selected morph currently drives.
+        frame.FlexTargetsLabel = vgui.Create("DLabel", flexOverrideButtons)
+        frame.FlexTargetsLabel:Dock(FILL)
+        frame.FlexTargetsLabel:DockMargin(4, 0, 0, 0)
+        frame.FlexTargetsLabel:SetText(L("mmd_vmd_npc.debug.flex_targets_none"))
 
         local flexScalePanel = vgui.Create("DPanel", frame)
         flexScalePanel:Dock(BOTTOM)
@@ -3530,6 +4067,7 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         -- colour is near-invisible on it).
         style_debug_label(frame.Summary)
         style_debug_label(frame.FlexOverrideTitle)
+        style_debug_label(frame.FlexTargetsLabel)
         style_debug_label(frame.DisableArmTwist)
         style_debug_label(frame.DisableHandTwist)
         style_debug_label(frame.DisableEyes)
@@ -3584,7 +4122,7 @@ local function read_frame_payload()
     local flexRows = {}
 
     for i = 1, flexCount do
-        flexRows[i] = {
+        local row = {
             mmd = net.ReadString(),
             source = net.ReadString(),
             resolvedName = net.ReadString(),
@@ -3592,6 +4130,12 @@ local function read_frame_payload()
             flexID = net.ReadInt(16),
             resolved = net.ReadBool(),
         }
+        row.flexIDs, row.flexNames = {}, {}
+        for t = 1, net.ReadUInt(8) do
+            row.flexIDs[t] = net.ReadInt(16)
+            row.flexNames[t] = net.ReadString()
+        end
+        flexRows[i] = row
     end
 
     local referenceInfo = {
@@ -3702,7 +4246,7 @@ net.Receive("mmdvmd_debug_response", function()
                 row.source,
                 fmt_num(row.weight),
                 fmt_num(row.scaledWeight ~= nil and row.scaledWeight or scaled_flex_weight(row)),
-                row.resolved and (tostring(row.resolvedName or "") .. " #" .. tostring(row.flexID)) or "unresolved"
+                row.resolved and flex_targets_text(row) or "unresolved"
             ))
         end
         if IsValid(flexScrollBar) and flexScroll > 0 then
@@ -3755,27 +4299,57 @@ net.Receive("mmdvmd_build_plan", function()
 
     show_build_lag_warning(buildID, motionID, startFrame, endFrame)
 
+    -- Tracks whose rotation or position never changes are sent once here
+    -- instead of in every frame of every batch.
     for i = 1, boneCount do
-        boneTracks[i] = {
+        local track = {
             mmd = net.ReadString(),
             source = net.ReadString(),
             role = net.ReadString(),
             resolved = net.ReadBool(),
             bone = net.ReadUInt(16),
         }
+        track.animRot = net.ReadBool()
+        if not track.animRot then
+            track.cx = net.ReadFloat()
+            track.cy = net.ReadFloat()
+            track.cz = net.ReadFloat()
+        end
+        track.animPos = net.ReadBool()
+        if not track.animPos then
+            track.cpx = net.ReadFloat()
+            track.cpy = net.ReadFloat()
+            track.cpz = net.ReadFloat()
+        end
+        boneTracks[i] = track
     end
 
     local flexCount = net.ReadUInt(16)
     local flexTracks = {}
     for i = 1, flexCount do
-        flexTracks[i] = {
+        local track = {
             mmd = net.ReadString(),
             source = net.ReadString(),
             resolvedName = net.ReadString(),
             resolved = net.ReadBool(),
             flexID = net.ReadInt(16),
         }
+        track.animated = net.ReadBool()
+        if not track.animated then track.cw = net.ReadFloat() end
+        track.flexIDs, track.flexNames = {}, {}
+        for t = 1, net.ReadUInt(8) do
+            track.flexIDs[t] = net.ReadInt(16)
+            track.flexNames[t] = net.ReadString()
+        end
+        flexTracks[i] = track
     end
+
+    -- The options the server builds (and names the cache file) with.
+    local options = {}
+    options.disableArmTwist = net.ReadBool()
+    options.disableHandTwist = net.ReadBool()
+    options.disableEyes = net.ReadBool()
+    options.disableSpinePelvisCorrection = net.ReadBool()
 
     MMDVMDNPC.ClientBuildJobs[buildID] = {
         motionID = motionID,
@@ -3785,226 +4359,252 @@ net.Receive("mmdvmd_build_plan", function()
         frame_start = startFrame,
         frame_end = endFrame,
         start_delay = startDelay,
+        -- Indexed by frame - frame_start + 1, so a re-requested batch
+        -- overwrites instead of duplicating frames.
         frames = {},
         bonesByID = {},
         flexesByID = {},
         boneTracks = boneTracks,
         flexTracks = flexTracks,
+        options = options,
+        flexScales = current_flex_scales(),
     }
 end)
 
-net.Receive("mmdvmd_build_compact_request", function()
-    local buildID = net.ReadUInt(32)
-    local motionID = net.ReadString()
-    local batchCount = net.ReadUInt(8)
-    local job = MMDVMDNPC.ClientBuildJobs[buildID]
-    if not job then return end
+do
+    -- Received batches wait here and the worker below solves one per frame. The
+    -- server keeps several batches in flight, so while this client solves one the
+    -- next is already on the way: network round trips overlap the solving
+    -- instead of adding to it, and batches arriving together are still solved
+    -- in separate frames.
+    MMDVMDNPC.ClientBuildBatches = MMDVMDNPC.ClientBuildBatches or {}
 
-    local visibleTarget = job.target
-    -- Build from the plan's model string so a NULL/never-networked target does
-    -- not yield an empty (all-bones-dropped) build that the server would cache.
-    local dummy = build_dummy_for_model(job.model, visibleTarget)
-    if not IsValid(dummy) then
-        MMDVMDNPC.ClientBuildJobs[buildID] = nil
-        destroy_build_dummy()
-        net.Start("mmdvmd_build_cancel_request")
-        net.SendToServer()
-        print("[MMD VMD] " .. LF("mmd_vmd_npc.console.build_failed_fmt", "could not create a hidden model for '" .. tostring(job.model or "") .. "'"))
-        return
-    end
-    local results = {}
-    local lastFrame = job.frame_start or 0
+    net.Receive("mmdvmd_build_compact_request", function()
+        local buildID = net.ReadUInt(32)
+        local firstFrame = net.ReadUInt(32)
+        local batchCount = net.ReadUInt(8)
+        local job = MMDVMDNPC.ClientBuildJobs[buildID]
+        if not job then return end
 
-    for _ = 1, batchCount do
-        local activeFrame = net.ReadUInt(32)
-        local rows = {}
-        for index, track in ipairs(job.boneTracks or {}) do
-            rows[index] = {
-                mmd = track.mmd,
-                source = track.source,
-                role = track.role,
-                x = net.ReadFloat(),
-                y = net.ReadFloat(),
-                z = net.ReadFloat(),
-                px = net.ReadFloat(),
-                py = net.ReadFloat(),
-                pz = net.ReadFloat(),
-                resolved = track.resolved,
-                bone = track.bone,
-            }
+        local boneTracks = job.boneTracks or {}
+        local flexTracks = job.flexTracks or {}
+        local boneCount, flexCount = #boneTracks, #flexTracks
+        local flexBase = boneCount * 6
+        local read_float = net.ReadFloat
+        local values = {}
+        for frame = 1, batchCount do
+            local v = {}
+            for i = 1, boneCount do
+                local track = boneTracks[i]
+                local o = (i - 1) * 6
+                if track.animRot then
+                    v[o + 1] = read_float()
+                    v[o + 2] = read_float()
+                    v[o + 3] = read_float()
+                else
+                    v[o + 1], v[o + 2], v[o + 3] = track.cx, track.cy, track.cz
+                end
+                if track.animPos then
+                    v[o + 4] = read_float()
+                    v[o + 5] = read_float()
+                    v[o + 6] = read_float()
+                else
+                    v[o + 4], v[o + 5], v[o + 6] = track.cpx, track.cpy, track.cpz
+                end
+            end
+            for i = 1, flexCount do
+                local track = flexTracks[i]
+                if track.animated then
+                    v[flexBase + i] = read_float()
+                else
+                    v[flexBase + i] = track.cw
+                end
+            end
+            values[frame] = v
         end
 
-        local flexRows = {}
-        for index, track in ipairs(job.flexTracks or {}) do
-            flexRows[index] = {
-                mmd = track.mmd,
-                source = track.source,
-                resolvedName = track.resolvedName,
-                weight = net.ReadFloat(),
-                flexID = track.flexID,
-                resolved = track.resolved,
-            }
+        local queue = MMDVMDNPC.ClientBuildBatches
+        queue[#queue + 1] = {
+            job = job,
+            buildID = buildID,
+            firstFrame = firstFrame,
+            count = batchCount,
+            values = values,
+        }
+    end)
+
+    local function frame_matches_layout(frame, layout)
+        local bones, layoutBones = frame.bones, layout.bones
+        if #bones ~= #layoutBones then return false end
+        for i = 1, #bones do
+            if bones[i][1] ~= layoutBones[i][1] then return false end
+        end
+        local flexes, layoutFlexes = frame.flexes, layout.flexes
+        if #flexes ~= #layoutFlexes then return false end
+        for i = 1, #flexes do
+            if flexes[i][1] ~= layoutFlexes[i][1] then return false end
+        end
+        return true
+    end
+
+    local BUILD_RESULT_BUDGET_BITS = 60000 * 8
+    local NET_ANGLE_MAX_BITS = 66
+
+    -- Results go back as one bone/flex layout per message followed by bare values,
+    -- and positions only for bones that moved in this batch (every other bone's
+    -- offset is exactly zero). A frame whose packet list differs from the layout
+    -- is sent explicitly. Messages split before the 64KB net limit.
+    local function send_build_results(buildID, firstFrame, frames)
+        local count = #frames
+        if count <= 0 then return end
+
+        local layout = frames[1]
+        local layoutBones, layoutFlexes = layout.bones, layout.flexes
+        local boneCount, flexCount = #layoutBones, #layoutFlexes
+        local matches, hasPos = {}, {}
+        for i = 1, count do
+            local frame = frames[i]
+            local match = frame_matches_layout(frame, layout)
+            matches[i] = match
+            if match then
+                local bones = frame.bones
+                for j = 1, boneCount do
+                    if not hasPos[j] then
+                        local b = bones[j]
+                        if b[5] ~= 0 or b[6] ~= 0 or b[7] ~= 0 then hasPos[j] = true end
+                    end
+                end
+            end
+        end
+        local posCount = 0
+        for j = 1, boneCount do
+            if hasPos[j] then posCount = posCount + 1 end
+        end
+        local headerBits = 32 + 32 + 8 + 16 + boneCount * 17 + 16 + flexCount * 16
+        local layoutFrameBits = 1 + boneCount * NET_ANGLE_MAX_BITS + posCount * 96 + flexCount * 32
+
+        local index = 1
+        while index <= count do
+            local bits = headerBits
+            local last = index - 1
+            while last < count do
+                local frame = frames[last + 1]
+                local frameBits = matches[last + 1] and layoutFrameBits
+                    or (1 + 16 + #frame.bones * (16 + NET_ANGLE_MAX_BITS + 96) + 16 + #frame.flexes * 48)
+                if last >= index and bits + frameBits > BUILD_RESULT_BUDGET_BITS then break end
+                bits = bits + frameBits
+                last = last + 1
+            end
+
+            net.Start("mmdvmd_build_frame_result")
+                net.WriteUInt(buildID, 32)
+                net.WriteUInt(firstFrame + index - 1, 32)
+                net.WriteUInt(last - index + 1, 8)
+                net.WriteUInt(boneCount, 16)
+                for j = 1, boneCount do
+                    net.WriteUInt(layoutBones[j][1], 16)
+                    net.WriteBool(hasPos[j] == true)
+                end
+                net.WriteUInt(flexCount, 16)
+                for j = 1, flexCount do
+                    net.WriteInt(layoutFlexes[j][1], 16)
+                end
+                for i = index, last do
+                    local frame = frames[i]
+                    local bones, flexes = frame.bones, frame.flexes
+                    net.WriteBool(matches[i])
+                    if matches[i] then
+                        for j = 1, boneCount do
+                            local b = bones[j]
+                            net.WriteAngle(scratch_angle(b[2], b[3], b[4]))
+                            if hasPos[j] then
+                                net.WriteFloat(b[5])
+                                net.WriteFloat(b[6])
+                                net.WriteFloat(b[7])
+                            end
+                        end
+                        for j = 1, flexCount do
+                            net.WriteFloat(flexes[j][2])
+                        end
+                    else
+                        local n = math.min(#bones, 4096)
+                        net.WriteUInt(n, 16)
+                        for j = 1, n do
+                            local b = bones[j]
+                            net.WriteUInt(b[1], 16)
+                            net.WriteAngle(scratch_angle(b[2], b[3], b[4]))
+                            net.WriteFloat(b[5])
+                            net.WriteFloat(b[6])
+                            net.WriteFloat(b[7])
+                        end
+                        local m = math.min(#flexes, 4096)
+                        net.WriteUInt(m, 16)
+                        for j = 1, m do
+                            net.WriteInt(flexes[j][1], 16)
+                            net.WriteFloat(flexes[j][2])
+                        end
+                    end
+                end
+            net.SendToServer()
+            index = last + 1
+        end
+    end
+
+    local function process_build_batch(batch)
+        local job, buildID = batch.job, batch.buildID
+        local visibleTarget = job.target
+        -- Build from the plan's model string so a NULL/never-networked target does
+        -- not yield an empty (all-bones-dropped) build that the server would cache.
+        local dummy = build_dummy_for_model(job.model, visibleTarget)
+        if not IsValid(dummy) then
+            MMDVMDNPC.ClientBuildJobs[buildID] = nil
+            destroy_build_dummy()
+            net.Start("mmdvmd_build_cancel_request")
+            net.SendToServer()
+            print("[MMD VMD] " .. LF("mmd_vmd_npc.console.build_failed_fmt", "could not create a hidden model for '" .. tostring(job.model or "") .. "'"))
+            return
         end
 
         local targetEntIndex = IsValid(visibleTarget) and visibleTarget:EntIndex() or 0
-        local packed, flexPacked = compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
-        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
-
-        for _, row in ipairs(rows) do
-            if row.resolved and row.bone then
-                job.bonesByID[row.bone] = {
-                    id = row.bone,
-                    name = row.source or "",
-                    source = row.source or "",
-                    mmd = row.mmd or "",
-                    role = row.role or "",
-                }
-            end
-        end
-        for _, row in ipairs(flexRows) do
-            if row.resolved and row.flexID and row.flexID >= 0 then
-                job.flexesByID[row.flexID] = {
-                    id = row.flexID,
-                    name = row.resolvedName or "",
-                    source = row.source or "",
-                    mmd = row.mmd or "",
-                    resolved = row.resolvedName or "",
-                }
-            end
+        local frameStart = job.frame_start or 0
+        local frames = {}
+        local lastFrame = batch.firstFrame
+        for i = 1, batch.count do
+            local frameNumber = batch.firstFrame + i - 1
+            local frame = compute_build_frame(job, dummy, batch.values[i], frameNumber, targetEntIndex)
+            frames[i] = frame
+            local slot = frameNumber - frameStart + 1
+            if slot >= 1 then job.frames[slot] = frame end
+            lastFrame = frameNumber
         end
 
-        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
-        lastFrame = activeFrame
+        update_build_status({
+            status = "building",
+            message = string.format("%s frame %d", job.motionID or "", lastFrame),
+            buildID = buildID,
+            motionID = job.motionID,
+            model = job.model or "",
+            currentFrame = lastFrame + 1,
+            startFrame = frameStart,
+            endFrame = job.frame_end or lastFrame,
+            queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
+        })
+
+        send_build_results(buildID, batch.firstFrame, frames)
     end
 
-    update_build_status({
-        status = "building",
-        message = string.format("%s frame %d", motionID, lastFrame),
-        buildID = buildID,
-        motionID = motionID,
-        model = job.model or "",
-        currentFrame = lastFrame + 1,
-        startFrame = job.frame_start or 0,
-        endFrame = job.frame_end or lastFrame,
-        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
-    })
-
-    net.Start("mmdvmd_build_frame_result")
-        net.WriteUInt(buildID, 32)
-        net.WriteUInt(math.min(#results, 255), 8)
-        for _, result in ipairs(results) do
-            local packed = result.packed or {}
-            local flexPacked = result.flexPacked or {}
-            net.WriteUInt(math.max(0, result.frame), 32)
-            net.WriteUInt(math.min(#packed, 4096), 16)
-            for i = 1, math.min(#packed, 4096) do
-                net.WriteUInt(packed[i].bone, 16)
-                net.WriteAngle(packed[i].ang)
-                net.WriteFloat(packed[i].pos.x)
-                net.WriteFloat(packed[i].pos.y)
-                net.WriteFloat(packed[i].pos.z)
-            end
-            net.WriteUInt(math.min(#flexPacked, 4096), 16)
-            for i = 1, math.min(#flexPacked, 4096) do
-                net.WriteInt(flexPacked[i].flexID, 16)
-                net.WriteFloat(flexPacked[i].weight)
+    hook.Add("Think", "MMDVMDNPCClientBuildWorker", function()
+        local queue = MMDVMDNPC.ClientBuildBatches
+        while queue[1] do
+            local batch = table.remove(queue, 1)
+            -- Batches of a finished or cancelled job are dropped unsolved.
+            if MMDVMDNPC.ClientBuildJobs[batch.buildID] == batch.job then
+                process_build_batch(batch)
+                return
             end
         end
-    net.SendToServer()
-end)
-
-net.Receive("mmdvmd_build_frame_request", function()
-    local buildID = net.ReadUInt(32)
-    local motionID = net.ReadString()
-    local batchCount = net.ReadUInt(8)
-    local job = MMDVMDNPC.ClientBuildJobs[buildID]
-
-    local results = {}
-    local lastFrame = 0
-    for _ = 1, batchCount do
-        local startFrame, endFrame, activeFrame, _, _, fps, _, targetEntIndex, _referenceInfo, rows, flexRows = read_frame_payload()
-        local visibleTarget = targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil
-        local dummy = build_dummy_for_target(visibleTarget)
-        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
-
-        if not job then
-            job = {
-                motionID = motionID,
-                model = IsValid(visibleTarget) and (visibleTarget:GetModel() or "") or "",
-                fps = fps,
-                frame_start = startFrame,
-                frame_end = endFrame,
-                frames = {},
-                bonesByID = {},
-                flexesByID = {},
-            }
-            MMDVMDNPC.ClientBuildJobs[buildID] = job
-        elseif job.model == "" and IsValid(visibleTarget) then
-            job.model = visibleTarget:GetModel() or ""
-        end
-        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
-        for _, row in ipairs(rows or {}) do
-            if row.resolved and row.bone then
-                job.bonesByID[row.bone] = {
-                    id = row.bone,
-                    name = row.source or "",
-                    source = row.source or "",
-                    mmd = row.mmd or "",
-                    role = row.role or "",
-                }
-            end
-        end
-        for _, row in ipairs(flexRows or {}) do
-            if row.resolved and row.flexID and row.flexID >= 0 then
-                job.flexesByID[row.flexID] = {
-                    id = row.flexID,
-                    name = row.resolvedName or "",
-                    source = row.source or "",
-                    mmd = row.mmd or "",
-                    resolved = row.resolvedName or "",
-                }
-            end
-        end
-
-        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
-        lastFrame = activeFrame
-    end
-
-    update_build_status({
-        status = "building",
-        message = string.format("%s frame %d", motionID, lastFrame),
-        buildID = buildID,
-        motionID = motionID,
-        model = job and job.model or "",
-        currentFrame = lastFrame + 1,
-        startFrame = job and job.frame_start or 0,
-        endFrame = job and job.frame_end or lastFrame,
-        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
-    })
-
-    net.Start("mmdvmd_build_frame_result")
-        net.WriteUInt(buildID, 32)
-        net.WriteUInt(math.min(#results, 255), 8)
-        for _, result in ipairs(results) do
-            local packed = result.packed or {}
-            local flexPacked = result.flexPacked or {}
-            net.WriteUInt(math.max(0, result.frame), 32)
-            net.WriteUInt(math.min(#packed, 4096), 16)
-            for i = 1, math.min(#packed, 4096) do
-                net.WriteUInt(packed[i].bone, 16)
-                net.WriteAngle(packed[i].ang)
-                net.WriteFloat(packed[i].pos.x)
-                net.WriteFloat(packed[i].pos.y)
-                net.WriteFloat(packed[i].pos.z)
-            end
-            net.WriteUInt(math.min(#flexPacked, 4096), 16)
-            for i = 1, math.min(#flexPacked, 4096) do
-                net.WriteInt(flexPacked[i].flexID, 16)
-                net.WriteFloat(flexPacked[i].weight)
-            end
-        end
-    net.SendToServer()
-end)
+    end)
+end
 
 net.Receive("mmdvmd_target_status", function()
     local valid = net.ReadBool()
@@ -4077,18 +4677,30 @@ net.Receive("mmdvmd_build_done", function()
     local job = buildID ~= 0 and MMDVMDNPC.ClientBuildJobs and MMDVMDNPC.ClientBuildJobs[buildID] or nil
     if job then
         if ok then
-            table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
-            MMDVMDNPC.ClientBuiltCache[path] = {
-                format = MMDVMDNPC.BuiltFormat,
-                motion_id = job.motionID,
-                model = job.model or "",
-                fps = job.fps or MMDVMDNPC.VMDFPS or 30,
-                frame_start = job.frame_start or 0,
-                frame_end = job.frame_end or 0,
-                bones = sorted_client_metadata(job.bonesByID),
-                flexes = sorted_client_metadata(job.flexesByID),
-                frames = job.frames,
-            }
+            -- The local replica is only usable when every frame is present
+            -- (playback indexes frames by number); otherwise the server's
+            -- networked pose plays alone.
+            local frames = job.frames
+            local complete = true
+            for i = 1, math.max(0, (job.frame_end or 0) - (job.frame_start or 0) + 1) do
+                if frames[i] == nil then
+                    complete = false
+                    break
+                end
+            end
+            if complete then
+                MMDVMDNPC.ClientBuiltCache[path] = {
+                    format = MMDVMDNPC.BuiltFormat,
+                    motion_id = job.motionID,
+                    model = job.model or "",
+                    fps = job.fps or MMDVMDNPC.VMDFPS or 30,
+                    frame_start = job.frame_start or 0,
+                    frame_end = job.frame_end or 0,
+                    bones = sorted_client_metadata(job.bonesByID),
+                    flexes = sorted_client_metadata(job.flexesByID),
+                    frames = frames,
+                }
+            end
         end
         MMDVMDNPC.ClientBuildJobs[buildID] = nil
     end
