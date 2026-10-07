@@ -5,6 +5,7 @@ MMDVMDNPC.BuildJobs = MMDVMDNPC.BuildJobs or {}
 MMDVMDNPC.BuildQueues = MMDVMDNPC.BuildQueues or {}
 MMDVMDNPC.BuiltCache = MMDVMDNPC.BuiltCache or {}
 MMDVMDNPC.Playbacks = MMDVMDNPC.Playbacks or {}
+MMDVMDNPC.DancingFlags = MMDVMDNPC.DancingFlags or {}
 MMDVMDNPC.SelfPlaybackProxies = MMDVMDNPC.SelfPlaybackProxies or {}
 MMDVMDNPC.SelfPlaybackVisuals = MMDVMDNPC.SelfPlaybackVisuals or {}
 MMDVMDNPC.SelfPlaybackMovementLocks = MMDVMDNPC.SelfPlaybackMovementLocks or {}
@@ -3835,6 +3836,23 @@ hook.Add("Think", "MMDVMDNPCBuiltPlaybackThink", function()
     end
     for ent, state in pairs(MMDVMDNPC.Playbacks) do
         update_playback_state(ent, state, now)
+    end
+    -- Tell clients which entities are dancing. A client that did not build the
+    -- dance itself (built in an earlier session, or started by someone else)
+    -- has nothing but the networked pose to go on; the PAC3 compatibility in
+    -- cl_menu.lua keys off this flag.
+    local dancing = MMDVMDNPC.DancingFlags
+    for ent in pairs(MMDVMDNPC.Playbacks) do
+        if not dancing[ent] and IsValid(ent) then
+            dancing[ent] = true
+            ent:SetNW2Bool("MMDVMDNPCDancing", true)
+        end
+    end
+    for ent in pairs(dancing) do
+        if not MMDVMDNPC.Playbacks[ent] then
+            dancing[ent] = nil
+            if IsValid(ent) then ent:SetNW2Bool("MMDVMDNPCDancing", false) end
+        end
     end
     -- Re-assert held debug flex poses every tick so external flex drivers
     -- cannot stomp them back to neutral. Playback entities are skipped —

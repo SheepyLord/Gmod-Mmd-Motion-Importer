@@ -1360,7 +1360,9 @@ local function root_motion_origin_active()
     return cv:GetBool()
 end
 
-local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
+-- skipSetup: for the PAC3 re-apply below, which runs while PAC prepares the
+-- entity for drawing; the draw sets the bones up itself.
+local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOffset, skipSetup)
     frameA = frameA or {}
     frameB = frameB or frameA
     fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
@@ -1409,7 +1411,7 @@ local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOf
     -- tick and those weights network fine; bones are the only thing that needs
     -- local smoothing.
 
-    setup_bones_now(ent)
+    if not skipSetup then setup_bones_now(ent) end
 end
 
 local function resolve_local_eye_bones(ent)
@@ -1890,6 +1892,7 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
 
             apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, state.pelvisZOffset or 0)
+            state.poseA, state.poseB, state.poseFraction = frames[lowerIndex], frames[upperIndex], fraction
             apply_local_eye_tracking(ent, state, now)
 
             if finished then
@@ -1898,6 +1901,127 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
         end
     end
 end)
+
+-- PAC3 compatibility. Every frame, just before drawing an entity that wears a
+-- PAC3 outfit, PAC3 resets all bone manipulations on it (pac.ResetBones from
+-- its PreDrawOpaqueRenderables hook) so the outfit's bone parts start from a
+-- clean pose, then calls the PAC3ResetBones hook. On a dancing NPC that reset
+-- wipes the dance too: with an outfit on (e.g. an entity part that swaps the
+-- model) the NPC flickered between the dance and its rest pose at its origin,
+-- like two copies, one dancing and one standing still. The pose is written
+-- back from that hook, from one of two sources:
+--  * this client's interpolated poser (LocalPlaybacks): its last sample;
+--  * otherwise the networked pose. The reset destroys this client's only copy,
+--    and the server resends a bone only when its value changes, so a copy is
+--    kept here: each frame records the bones whose values changed since the
+--    last drawn frame, i.e. what arrived from the server since. Comparing with
+--    the drawn state keeps the outfit's own bone offsets (applied after the
+--    reset, every frame) out of the copy, so they cannot accumulate.
+do
+    local copies = {}
+    local NONE = {}
+
+    local function dancing(ent)
+        if ent:IsDormant() then return false end
+        local playbacks = MMDVMDNPC.LocalPlaybacks
+        if playbacks and playbacks[ent] then return true end
+        return ent:GetNW2Bool("MMDVMDNPCDancing", false)
+    end
+
+    -- all: take every non-zero manipulation, for an entity PAC has not reset yet.
+    local function record_changes(ent, copy, all)
+        if not all and not copy.drawn then return end
+        local getAngles, getPosition = ent.GetManipulateBoneAngles, ent.GetManipulateBonePosition
+        local drawnAng, drawnPos = copy.drawnAng, copy.drawnPos
+        local ang, pos, keepAng, keepPos = copy.ang, copy.pos, copy.keepAng, copy.keepPos
+        for bone = 0, copy.count - 1 do
+            local o = bone * 3
+            local p, y, r = getAngles(ent, bone):Unpack()
+            if all and (p ~= 0 or y ~= 0 or r ~= 0)
+                or not all and (p ~= drawnAng[o + 1] or y ~= drawnAng[o + 2] or r ~= drawnAng[o + 3]) then
+                ang[o + 1], ang[o + 2], ang[o + 3] = p, y, r
+                keepAng[bone] = true
+            end
+            local x, yy, z = getPosition(ent, bone):Unpack()
+            if all and (x ~= 0 or yy ~= 0 or z ~= 0)
+                or not all and (x ~= drawnPos[o + 1] or yy ~= drawnPos[o + 2] or z ~= drawnPos[o + 3]) then
+                pos[o + 1], pos[o + 2], pos[o + 3] = x, yy, z
+                keepPos[bone] = true
+            end
+        end
+    end
+
+    hook.Add("Think", "MMDVMDNPCPACDancePose", function()
+        -- PAC3's own set of entities it draws outfits on (and so resets).
+        local drawn = pac and pac.drawn_entities
+        if not istable(drawn) then drawn = NONE end
+        for ent, copy in pairs(copies) do
+            if not IsValid(ent) or not drawn[ent] or not dancing(ent)
+                or copy.model ~= ent:GetModel() or copy.count ~= ent:GetBoneCount() then
+                copies[ent] = nil
+            end
+        end
+        for ent in pairs(drawn) do
+            if IsValid(ent) and dancing(ent) then
+                local copy = copies[ent]
+                if copy then
+                    record_changes(ent, copy, false)
+                else
+                    copy = {
+                        model = ent:GetModel(),
+                        count = ent:GetBoneCount() or 0,
+                        drawnAng = {}, drawnPos = {},
+                        ang = {}, pos = {}, keepAng = {}, keepPos = {},
+                    }
+                    copies[ent] = copy
+                    if not ent.pac_bones_once then record_changes(ent, copy, true) end
+                end
+            end
+        end
+    end)
+
+    hook.Add("PostRender", "MMDVMDNPCPACDancePose", function()
+        for ent, copy in pairs(copies) do
+            if IsValid(ent) then
+                local getAngles, getPosition = ent.GetManipulateBoneAngles, ent.GetManipulateBonePosition
+                local drawnAng, drawnPos = copy.drawnAng, copy.drawnPos
+                for bone = 0, copy.count - 1 do
+                    local o = bone * 3
+                    drawnAng[o + 1], drawnAng[o + 2], drawnAng[o + 3] = getAngles(ent, bone):Unpack()
+                    drawnPos[o + 1], drawnPos[o + 2], drawnPos[o + 3] = getPosition(ent, bone):Unpack()
+                end
+                copy.drawn = true
+            end
+        end
+    end)
+
+    hook.Add("PAC3ResetBones", "MMDVMDNPCPACDancePose", function(ent)
+        local playbacks = MMDVMDNPC.LocalPlaybacks
+        local state = playbacks and playbacks[ent]
+        if state then
+            if state.poseA then
+                apply_local_built_sample(ent, state.poseA, state.poseB, state.poseFraction, state.pelvisZOffset or 0, true)
+            end
+            local eye = state.eyeTrack
+            if eye and eye.eyeVec then
+                if eye.eyeBoneL ~= nil then ent:ManipulateBonePosition(eye.eyeBoneL, eye.eyeVec) end
+                if eye.eyeBoneR ~= nil then ent:ManipulateBonePosition(eye.eyeBoneR, eye.eyeVec) end
+            end
+            return
+        end
+        local copy = copies[ent]
+        if not copy then return end
+        local ang, pos = copy.ang, copy.pos
+        for bone in pairs(copy.keepAng) do
+            local o = bone * 3
+            ent:ManipulateBoneAngles(bone, scratch_angle(ang[o + 1], ang[o + 2], ang[o + 3]), false)
+        end
+        for bone in pairs(copy.keepPos) do
+            local o = bone * 3
+            ent:ManipulateBonePosition(bone, scratch_vector(pos[o + 1], pos[o + 2], pos[o + 3]))
+        end
+    end)
+end
 
 local function stop_audio_channel(token)
     token = tonumber(token) or 0
