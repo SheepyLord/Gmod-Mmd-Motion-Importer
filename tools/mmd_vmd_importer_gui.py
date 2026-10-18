@@ -7,6 +7,7 @@ import sys
 import html
 import json
 import os
+import re
 import subprocess
 import time
 import traceback
@@ -29,11 +30,13 @@ except ModuleNotFoundError:
     from preview.widget import PreviewWidget  # type: ignore[no-redef]
 
 
-DEFAULT_BAKE_STARTUP_SECONDS = 15.0
-DEFAULT_BAKE_SECONDS_PER_FRAME = 60.0 / 5000.0
+DEFAULT_BAKE_STARTUP_SECONDS = 1.0
+DEFAULT_BAKE_SECONDS_PER_FRAME = 1.0 / 1500.0
 BAKE_TIMING_SAMPLE_LIMIT = 80
 BAKE_TIMING_PRIOR_FRAME_COUNTS = (0, 5000, 15000, 30000)
-BAKE_TIMING_MODEL_VERSION = 2
+# Bumped for the native baker so Blender-era timing samples are discarded.
+BAKE_TIMING_MODEL_VERSION = 3
+BAKED_FRAMES_PATTERN = re.compile(r"Baked frames (\d+)\.\.(\d+) of (\d+)")
 
 
 def bundled_resource_path(*parts: str) -> Path:
@@ -117,8 +120,8 @@ class ImportWorker(QtCore.QThread):
             gmod_dir = Path(str(self.settings["gmod_dir"])) if self.settings.get("gmod_dir") else import_vmd.find_gmod_install()
             self._log(I18N.t("log.using_gmod", path=gmod_dir))
 
-            # Build the camera track BEFORE the multi-minute Blender bake so a
-            # missing or corrupt camera VMD fails fast instead of wasting the bake.
+            # Build the camera track before the bake so a missing or corrupt
+            # camera VMD fails fast instead of after the bake.
             camera_track = None
             camera_path_raw = str(self.settings.get("camera_vmd") or "")
             if camera_path_raw:
@@ -127,38 +130,35 @@ class ImportWorker(QtCore.QThread):
                     raise FileNotFoundError(I18N.t("error.camera_vmd_missing", path=camera_path_raw))
                 camera_track = import_vmd.build_camera_track(camera_path, self._log)
 
-            baked_dir = import_vmd.BAKED_OUTPUT_DIR
             model_path = import_vmd.find_default_mmd_model()
-            # Blender is resolved by import_vmd (bundled / reused / extracted) — the
-            # user no longer picks it, so always let the resolver choose.
-            blender_path = None
             flex_vmds = [Path(str(path)) for path in self.settings.get("flex_vmds", [])]
             motion_name = str(self.settings.get("motion_name") or "").strip()
             audio_offset = float(self.settings.get("audio_offset") or 0.0)
 
-            rotation_json = baked_dir / import_vmd.PARENT_CORRECTED_ROTATION_JSON
-            motion_for_cache = import_vmd.bake_vmd_with_blender(
-                body_vmd,
-                blender=blender_path,
-                mmd_model=model_path,
-                output_dir=baked_dir,
-                output_rotation_json=rotation_json,
-                progress=self._log,
-                cancel_check=self._cancelled,
-                disable_foot_ik=bool(self.settings.get("disable_foot_ik")),
-            )
+            try:
+                rotation_document = import_vmd.bake_vmd_native(
+                    body_vmd,
+                    mmd_model=model_path,
+                    progress=self._log,
+                    cancel_check=self._cancelled,
+                    disable_foot_ik=bool(self.settings.get("disable_foot_ik")),
+                )
+            except RuntimeError:
+                if self.cancel_requested:
+                    raise RuntimeError(I18N.t("error.import_cancelled"))
+                raise
             if self.cancel_requested:
                 raise RuntimeError(I18N.t("error.import_cancelled"))
 
             music_metadata = None
             music_path_raw = str(self.settings.get("music_path") or "")
-            motion_name_source = motion_name or motion_for_cache
+            motion_name_source = motion_name or body_vmd
             if music_path_raw:
                 music_metadata = import_vmd.convert_music_to_gmod_mp3(Path(music_path_raw), gmod_dir, motion_name_source, self._log, vmd_path=body_vmd)
 
             output_dir = gmod_dir / "garrysmod" / "data" / "mmd_vmd_npc" / "motions"
             output_json = import_vmd.write_motion_json(
-                rotation_json,
+                rotation_document,
                 output_dir,
                 motion_name_source,
                 body_vmd,
@@ -186,7 +186,6 @@ class ImportWorker(QtCore.QThread):
                 )
                 addon_gma = str(addon_output)
             result = {
-                "baked_vmd": str(motion_for_cache),
                 "motion_json": str(output_json),
                 "addon_gma": addon_gma,
                 "motion_name": motion_name,
@@ -367,10 +366,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.output_title_labels: dict[str, QtWidgets.QLabel] = {}
         self.progress_timer = QtCore.QTimer(self)
         self.progress_timer.timeout.connect(self.update_import_progress)
-        # The Blender bake emits hundreds of log lines; appending each one to the
-        # QPlainTextEdit individually re-lays-out the widget every line and makes
-        # the UI stutter. Buffer the raw text and flush it in batches (~10 Hz);
-        # progress-bar detection still runs per line so feedback stays live.
+        # Appending log lines to the QPlainTextEdit one at a time re-lays-out the
+        # widget every line and makes the UI stutter on chatty steps. Buffer the
+        # raw text and flush it in batches (~10 Hz); progress-bar detection still
+        # runs per line so feedback stays live.
         self._log_buffer: list[str] = []
         self._log_flush_timer = QtCore.QTimer(self)
         self._log_flush_timer.setInterval(100)
@@ -597,8 +596,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "follow_camera_check"):
             self.follow_camera_check.setToolTip(self.tr("preview.follow_camera.tooltip"))
 
-        if hasattr(self, "blender_info_label"):
-            self.blender_info_label.setText(self.tr("inputs.blender.bundled", version=import_vmd.BUNDLED_BLENDER_VERSION))
         if hasattr(self, "detect_gmod_button"):
             self.detect_gmod_button.setToolTip(self.tr("inputs.detect_gmod.tooltip"))
             self.export_addon_check.setText(self.tr("inputs.export_addon"))
@@ -619,7 +616,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "log_group"):
             self.log_group.setTitle(self.tr("inputs.log_output.title"))
             for key, label in (
-                ("baked_vmd", self.tr("inputs.output.baked_vmd")),
                 ("motion_json", self.tr("inputs.output.motion_json")),
                 ("addon_gma", self.tr("inputs.output.addon_gma")),
                 ("music", self.tr("inputs.output.music")),
@@ -683,13 +679,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.camera_row = self.make_path_row("inputs.camera_vmd.label", "file", "filter.vmd_motion", required=False, hint_key="inputs.camera_vmd.hint")
         for row in (self.body_row, self.gmod_row, self.music_row, self.camera_row):
             layout.addWidget(row)
-
-        # Blender ships with the importer (or is reused from a sibling importer),
-        # so there is no Blender path to pick or detect anymore.
-        self.blender_info_label = QtWidgets.QLabel(self.tr("inputs.blender.bundled", version=import_vmd.BUNDLED_BLENDER_VERSION))
-        self.blender_info_label.setObjectName("fieldHint")
-        self.blender_info_label.setWordWrap(True)
-        layout.addWidget(self.blender_info_label)
 
         audio_offset_layout = QtWidgets.QGridLayout()
         self.input_audio_offset_label = QtWidgets.QLabel(self.tr("inputs.audio_offset.label", seconds=0.0))
@@ -802,7 +791,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         log_layout = QtWidgets.QVBoxLayout(self.log_group)
         output_layout = QtWidgets.QFormLayout()
         for key, label in (
-            ("baked_vmd", self.tr("inputs.output.baked_vmd")),
             ("motion_json", self.tr("inputs.output.motion_json")),
             ("addon_gma", self.tr("inputs.output.addon_gma")),
             ("music", self.tr("inputs.output.music")),
@@ -1154,21 +1142,21 @@ class ImporterWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.clipboard().setText(self.log.toPlainText())
 
     def progress_stage_from_log(self, message: str) -> tuple[int, str, str] | None:
+        chunk = BAKED_FRAMES_PATTERN.search(message)
+        if chunk:
+            # Per-batch bake progress spans 20-84%.
+            done, last = int(chunk.group(2)) + 1, int(chunk.group(3)) + 1
+            return 20 + int(64 * min(1.0, done / max(1, last))), self.tr("progress.stage.baking_pose"), "#d29922"
         checks = [
-            ("Starting Blender bake process", 3, self.tr("progress.stage.starting_blender"), "#58a6ff"),
-            ("Enabled mmd_tools", 8, self.tr("progress.stage.mmd_tools_ready"), "#58a6ff"),
-            ("mmd_tools operators are already available", 8, self.tr("progress.stage.mmd_tools_ready"), "#58a6ff"),
-            ("Importing MMD model", 12, self.tr("progress.stage.importing_model"), "#58a6ff"),
-            ("Imported MMD model", 22, self.tr("progress.stage.model_loaded"), "#2ea043"),
-            ("Importing VMD motion", 28, self.tr("progress.stage.importing_motion"), "#58a6ff"),
-            ("Imported VMD motion", 35, self.tr("progress.stage.motion_loaded"), "#2ea043"),
-            ("Starting Blender visual bake", 45, self.tr("progress.stage.baking_pose"), "#d29922"),
-            ("Baked pose frames", 80, self.tr("progress.stage.pose_complete"), "#2ea043"),
-            ("Exporting parent-corrected rotation JSON", 84, self.tr("progress.stage.exporting_transforms"), "#d29922"),
-            ("Exported parent-corrected bone rotations", 88, self.tr("progress.stage.transforms_exported"), "#2ea043"),
-            ("Exporting baked VMD", 90, self.tr("progress.stage.exporting_vmd"), "#d29922"),
-            ("Exported baked VMD", 92, self.tr("progress.stage.vmd_exported"), "#2ea043"),
-            ("Blender bake process finished", 94, self.tr("progress.stage.blender_finished"), "#2ea043"),
+            ("Starting native motion bake", 3, self.tr("progress.stage.baking_motion"), "#58a6ff"),
+            ("Importing MMD model", 6, self.tr("progress.stage.importing_model"), "#58a6ff"),
+            ("Imported MMD model", 10, self.tr("progress.stage.model_loaded"), "#2ea043"),
+            ("Importing VMD motion", 12, self.tr("progress.stage.importing_motion"), "#58a6ff"),
+            ("Imported VMD motion", 18, self.tr("progress.stage.motion_loaded"), "#2ea043"),
+            ("Baking pose frames", 20, self.tr("progress.stage.baking_pose"), "#d29922"),
+            ("Exporting parent-corrected bone rotations", 86, self.tr("progress.stage.exporting_transforms"), "#d29922"),
+            ("Exported parent-corrected bone rotations", 89, self.tr("progress.stage.transforms_exported"), "#2ea043"),
+            ("Native bake finished", 92, self.tr("progress.stage.pose_complete"), "#2ea043"),
             ("Parsed ", 96, self.tr("progress.stage.merging_flex"), "#58a6ff"),
             ("Converting music to MP3", 97, self.tr("progress.stage.converting_music"), "#58a6ff"),
             ("Wrote GMod sound", 98, self.tr("progress.stage.music_written"), "#2ea043"),
@@ -1307,7 +1295,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         intercept = (sum_y - slope * sum_x) / count
         if slope < 0:
             slope = DEFAULT_BAKE_SECONDS_PER_FRAME
-        return max(0.001, min(1.0, slope)), max(0.0, intercept), len(real_samples)
+        return max(0.00001, min(1.0, slope)), max(0.0, intercept), len(real_samples)
 
     def record_bake_timing_sample(self) -> str:
         if self.import_started_at <= 0:
@@ -1863,8 +1851,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if worker is not None and worker.isRunning():
             worker.cancel()
             if not worker.wait(5000):
-                # The bake only polls cancel between Blender output lines; keep
-                # waiting rather than tearing the thread down mid-run.
+                # The bake only polls cancel between frame batches (and music
+                # conversion not at all); keep waiting rather than tearing the
+                # thread down mid-run.
                 worker.wait()
         manager_worker = self._manager_worker
         if manager_worker is not None and manager_worker.isRunning():
@@ -1880,7 +1869,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.append_log(timing_message)
             detail = f"{detail} {timing_message}"
         self.finish_progress(detail, True)
-        self.output_labels["baked_vmd"].setText(str(result.get("baked_vmd", "")))
         self.output_labels["motion_json"].setText(str(result.get("motion_json", "")))
         self.output_labels["addon_gma"].setText(str(result.get("addon_gma", "")))
         music = result.get("music") or {}

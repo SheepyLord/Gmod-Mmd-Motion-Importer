@@ -44,6 +44,8 @@ FLEX_SCRIPT = SOURCE_MODELS / "flex_mmd_to_source.py"
 DEFAULT_MMD_MODEL_DIR = SOURCE_MODELS / "mmd_model"
 DEFAULT_MMD_MODEL_NAME = "李织烟.pmx"
 DEFAULT_SOURCE_SMD = SOURCE_MODELS / "mmd_model_source_format" / "Body.smd"
+# Legacy reference bake through Blender + mmd_tools (CLI --bake-with-blender
+# only). The importer itself bakes natively with vmd_baker and needs no Blender.
 BLENDER_BAKE_SCRIPT = ROOT / "tools" / "blender_bake_vmd.py"
 # Upper bound on the bake range (~2.3 hours at 30fps); anything larger is almost
 # certainly a corrupt VMD frame count rather than a real motion.
@@ -54,22 +56,16 @@ STEAM_BLENDER_APP_ID = "365670"
 STEAM_BLENDER_URL = "https://store.steampowered.com/app/365670/Blender/"
 MIN_SUPPORTED_BLENDER_VERSION = (4, 3, 0)
 
-# Blender is bundled with (or first-run extracted by) the importer so no separate
-# install is required. The portable zip's top-level folder is named after the
-# build, and a completed portable extraction always contains a sibling `portable`
-# directory, which doubles as an "extraction finished" marker.
-BUNDLED_BLENDER_VERSION = "4.5.10"
-BUNDLED_BLENDER_DIRNAME = f"blender-{BUNDLED_BLENDER_VERSION}-windows-x64"
-BUNDLED_BLENDER_ZIP_NAME = f"{BUNDLED_BLENDER_DIRNAME}.zip"
-BUNDLED_BLENDER_PORTABLE_MARKER = "portable"
-# This importer's own local-data folder (only used when it must extract its own
-# embedded Blender because no reusable install was found).
+# A completed portable Blender extraction always contains a sibling `portable`
+# directory beside blender.exe; it doubles as an "extraction finished" marker.
+BLENDER_PORTABLE_MARKER = "portable"
+# This importer's own local-data folder (Motion Manager index).
 APP_LOCAL_DIR_NAME = "MMDVMDNPC"
-# Optional bundled mmd_tools zip so a freshly-extracted Blender bakes offline.
-BUNDLED_ADDONS_SUBDIR = "blender_addons"
-# The sibling "Simple Character Model Importer" ships the SAME Blender 4.5.10 and
-# extracts it (with mmd_tools already installed) under its local-data folder.
-# Reusing that install avoids a second ~1 GB copy on disk and a redundant extract.
+# Vendored mmd_tools zip so the legacy Blender bake can install it offline.
+BLENDER_ADDONS_SUBDIR = "blender_addons"
+# The sibling "Simple Character Model Importer" extracts a portable Blender 4.5
+# (with mmd_tools installed) under its local-data folder; the legacy Blender
+# bake reuses it when present.
 SCMI_APP_DIR_NAME = "MMDCharacterImporter"
 
 GMOD_SOUND_SUBDIR = "mmd_vmd_npc/music"
@@ -211,6 +207,13 @@ class PropertyFrame:
 
 
 @dataclass
+class PMXIKLink:
+    bone: int
+    limit_min: tuple[float, float, float] | None
+    limit_max: tuple[float, float, float] | None
+
+
+@dataclass
 class PMXBone:
     index: int
     name: str
@@ -222,6 +225,14 @@ class PMXBone:
     tail_offset: tuple[float, float, float] | None
     local_axis_x: tuple[float, float, float] | None
     local_axis_z: tuple[float, float, float] | None
+    transform_level: int = 0
+    append_parent: int = -1
+    append_ratio: float = 0.0
+    fixed_axis: tuple[float, float, float] | None = None
+    ik_target: int = -1
+    ik_loop_count: int = 0
+    ik_limit_angle: float = 0.0
+    ik_links: list[PMXIKLink] = field(default_factory=list)
 
 
 @dataclass
@@ -512,7 +523,7 @@ class PMXReader:
             english_name = self.read_text()
             position = self.unpack("<fff")
             parent = self.read_index(self.bone_index_size)
-            self.offset += 4
+            transform_level = self.unpack("<i")
             flags = self.unpack("<H")
             tail_index = None
             tail_offset = None
@@ -520,26 +531,58 @@ class PMXReader:
                 tail_index = self.read_index(self.bone_index_size)
             else:
                 tail_offset = self.unpack("<fff")
+            append_parent = -1
+            append_ratio = 0.0
             if flags & (0x0100 | 0x0200):
-                self.read_index(self.bone_index_size)
-                self.offset += 4
+                append_parent = self.read_index(self.bone_index_size)
+                append_ratio = float(self.unpack("<f"))
             local_axis_x = None
             local_axis_z = None
+            fixed_axis = None
             if flags & 0x0400:
-                self.offset += 12
+                fixed_axis = self.unpack("<fff")
             if flags & 0x0800:
                 local_axis_x = self.unpack("<fff")
                 local_axis_z = self.unpack("<fff")
             if flags & 0x2000:
                 self.offset += 4
+            ik_target = -1
+            ik_loop_count = 0
+            ik_limit_angle = 0.0
+            ik_links: list[PMXIKLink] = []
             if flags & 0x0020:
-                self.read_index(self.bone_index_size)
-                self.offset += 8
+                ik_target = self.read_index(self.bone_index_size)
+                ik_loop_count = self.unpack("<i")
+                ik_limit_angle = float(self.unpack("<f"))
                 for _ in range(self.unpack("<i")):
-                    self.read_index(self.bone_index_size)
+                    link_bone = self.read_index(self.bone_index_size)
+                    limit_min = limit_max = None
                     if self.unpack("<B"):
-                        self.offset += 24
-            bones.append(PMXBone(index, name, english_name, position, parent, flags, tail_index, tail_offset, local_axis_x, local_axis_z))
+                        limit_min = self.unpack("<fff")
+                        limit_max = self.unpack("<fff")
+                    ik_links.append(PMXIKLink(link_bone, limit_min, limit_max))
+            bones.append(
+                PMXBone(
+                    index,
+                    name,
+                    english_name,
+                    position,
+                    parent,
+                    flags,
+                    tail_index,
+                    tail_offset,
+                    local_axis_x,
+                    local_axis_z,
+                    transform_level=transform_level,
+                    append_parent=append_parent,
+                    append_ratio=append_ratio,
+                    fixed_axis=fixed_axis,
+                    ik_target=ik_target,
+                    ik_loop_count=ik_loop_count,
+                    ik_limit_angle=ik_limit_angle,
+                    ik_links=ik_links,
+                )
+            )
         return bones
 
 
@@ -2237,8 +2280,7 @@ def blender_path_version_key(path: Path) -> tuple[int, int, int]:
 
 
 def app_local_dir() -> Path:
-    """This importer's own local-data folder (only written to when it has to
-    extract its embedded Blender because no reusable install was found)."""
+    """This importer's own local-data folder (Motion Manager index)."""
     local = os.environ.get("LOCALAPPDATA")
     if local:
         return Path(local) / APP_LOCAL_DIR_NAME
@@ -2275,7 +2317,7 @@ def blender_install_is_complete(blender_exe: Path | None) -> bool:
     if not blender_exe:
         return False
     try:
-        return blender_exe.is_file() and (blender_exe.parent / BUNDLED_BLENDER_PORTABLE_MARKER).is_dir()
+        return blender_exe.is_file() and (blender_exe.parent / BLENDER_PORTABLE_MARKER).is_dir()
     except OSError:
         return False
 
@@ -2337,162 +2379,29 @@ def path_blender_version_supported(path: Path | str) -> bool:
     return is_blender_version_supported(parts)
 
 
-def _cached_bundled_blender_dir() -> Path:
-    """Where this importer extracts its own embedded Blender, keyed by version so
-    a future upgrade extracts alongside rather than over the old copy."""
-    return app_local_dir() / "software" / "blender" / BUNDLED_BLENDER_VERSION
-
-
-def cached_bundled_blender() -> Path | None:
-    exe = blender_exe_in_dir(_cached_bundled_blender_dir())
-    return exe if blender_install_is_complete(exe) else None
-
-
-def bundled_blender_sources() -> list[Path]:
-    """Directories that may hold this build's Blender: as an already-extracted
-    `<dirname>/` sidecar or as the portable `<dirname>.zip` to extract once.
-
-    Order: frozen bundle payload, folder beside the exe (onedir/sidecar), dev repo."""
-    roots: list[Path] = []
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            roots.append(Path(meipass) / "blender")
-        try:
-            roots.append(Path(sys.executable).resolve().parent / "blender")
-        except OSError:
-            pass
-    roots.append(ROOT / "tools" / "blender")
-    return roots
-
-
-def extract_bundled_blender(zip_path: Path, progress: ProgressCallback | None = None) -> Path:
-    """Extract the embedded portable Blender zip once into the per-user cache and
-    return blender.exe.
-
-    The official portable zip ships WITHOUT the `portable` folder, so we create it
-    (matching the sibling Simple Character Model Importer) both to run Blender in
-    portable mode and to serve as the "extraction finished" marker. Extraction
-    lands in a per-pid staging dir and is atomically renamed only after the marker
-    is written; a peer process that already produced a complete install is never
-    clobbered, so two first-run instances are safe."""
-    dest = _cached_bundled_blender_dir()
-    cached = cached_bundled_blender()
-    if cached:
-        return cached
-
-    dest.mkdir(parents=True, exist_ok=True)
-    emit_progress(progress, f"Preparing bundled Blender {BUNDLED_BLENDER_VERSION} (first run only)...")
-    # Stage as a SIBLING of the version dir, not inside it: cached_bundled_blender
-    # rglobs `dest`, so an in-dest staging copy would be mistaken for a finished
-    # peer install (and then deleted by the finally).
-    staging = dest.parent / f".extract_{os.getpid()}"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
+def vendored_mmd_tools_archive() -> Path | None:
+    """The mmd_tools zip vendored in tools/blender_addons, so the legacy Blender
+    bake can install mmd_tools offline. Returns None (and the bake falls back to
+    its network download) when it is missing."""
+    root = ROOT / "tools" / BLENDER_ADDONS_SUBDIR
     try:
-        import zipfile
-
-        with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(staging)
-        extracted_exe = blender_exe_in_dir(staging)
-        if extracted_exe is None or not extracted_exe.is_file():
-            raise RuntimeError(f"bundled Blender archive did not contain blender.exe: {zip_path}")
-        # Enable portable mode and mark the extraction complete. The stock zip has
-        # no `portable` folder, so blender_install_is_complete would otherwise fail.
-        (extracted_exe.parent / BUNDLED_BLENDER_PORTABLE_MARKER).mkdir(exist_ok=True)
-
-        # A concurrent instance may have finished a complete install while we
-        # extracted; use it rather than fighting over the destination.
-        peer = cached_bundled_blender()
-        if peer:
-            return peer
-        final_dir = dest / extracted_exe.parent.name
-        if final_dir.exists() and not blender_install_is_complete(blender_exe_in_dir(final_dir)):
-            # Only ever clear an INCOMPLETE leftover, never a peer's live install.
-            shutil.rmtree(final_dir, ignore_errors=True)
-        try:
-            os.replace(str(extracted_exe.parent), str(final_dir))
-        except OSError:
-            # Lost the finalize race (a peer created final_dir); use theirs if complete.
-            peer = cached_bundled_blender()
-            if peer:
-                return peer
-            raise
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-    exe = cached_bundled_blender()
-    if not exe:
-        raise RuntimeError(f"failed to extract bundled Blender to {dest}")
-    emit_progress(progress, f"Bundled Blender ready: {exe}")
-    return exe
-
-
-def bundled_blender_executable(progress: ProgressCallback | None = None) -> Path | None:
-    """Blender that ships with (or was extracted once by) this importer, or None
-    when this build was made without an embedded Blender."""
-    cached = cached_bundled_blender()
-    if cached:
-        return cached
-    # Already-extracted sidecar (onedir/dev): exact name first, then any
-    # blender-*-windows-x64 folder so a differently-versioned build still resolves.
-    for root in bundled_blender_sources():
-        sidecar = blender_exe_in_dir(root / BUNDLED_BLENDER_DIRNAME)
-        if blender_install_is_complete(sidecar):
-            return sidecar
-        if root.is_dir():
-            for candidate in sorted(root.glob("blender-*-windows-x64")):
-                exe = blender_exe_in_dir(candidate)
-                if blender_install_is_complete(exe) and path_blender_version_supported(candidate):
-                    return exe
-    # Embedded/sidecar zip to extract once: exact name first, then any matching zip.
-    for root in bundled_blender_sources():
-        zip_path = root / BUNDLED_BLENDER_ZIP_NAME
-        if zip_path.is_file():
-            return extract_bundled_blender(zip_path, progress)
-        if root.is_dir():
-            for candidate in sorted(root.glob("blender-*-windows-x64.zip")):
-                if candidate.is_file() and path_blender_version_supported(candidate):
-                    return extract_bundled_blender(candidate, progress)
-    return None
-
-
-def bundled_mmd_tools_archive() -> Path | None:
-    """A bundled mmd_tools zip shipped alongside this importer, if any, so a
-    freshly-extracted Blender can install mmd_tools offline. Returns None (and the
-    bake falls back to its network download) when nothing is bundled."""
-    roots: list[Path] = []
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            roots.append(Path(meipass) / BUNDLED_ADDONS_SUBDIR)
-        try:
-            roots.append(Path(sys.executable).resolve().parent / BUNDLED_ADDONS_SUBDIR)
-        except OSError:
-            pass
-    roots.append(ROOT / "tools" / BUNDLED_ADDONS_SUBDIR)
-    for root in roots:
-        try:
-            if not root.is_dir():
-                continue
-        except OSError:
-            continue
+        if not root.is_dir():
+            return None
         direct = root / "mmd_tools.zip"
         if direct.is_file():
             return direct
         matches = sorted(root.glob("*mmd*tools*.zip"))
-        if matches:
-            return matches[0]
-    return None
+    except OSError:
+        return None
+    return matches[0] if matches else None
 
 
-def blender_is_trusted_bundled(blender: Path | None) -> bool:
-    """True when `blender` is a known-good portable install we provisioned (SCMI's
-    managed install, our own cache, or a sidecar) AND its path names a supported
-    version, so the `--version` probe can be skipped. Any other path — including a
-    provisioned install of an unsupported version — is still verified so the
-    'Blender X is not supported' error is never silently skipped."""
+def blender_is_trusted_install(blender: Path | None) -> bool:
+    """True when `blender` is the Simple Character Model Importer's managed
+    portable install AND its path names a supported version, so the `--version`
+    probe can be skipped. Any other path — including a managed install of an
+    unsupported version — is still verified so the 'Blender X is not supported'
+    error is never silently skipped."""
     if not blender:
         return False
     if not blender_install_is_complete(blender):
@@ -2500,20 +2409,14 @@ def blender_is_trusted_bundled(blender: Path | None) -> bool:
     if not path_blender_version_supported(blender):
         return False
     try:
-        resolved = blender.resolve()
-    except OSError:
-        resolved = blender
-    trusted_roots = [scmi_app_local_dir(), app_local_dir(), *bundled_blender_sources()]
-    for root in trusted_roots:
-        try:
-            resolved.relative_to(root.resolve())
-            return True
-        except (OSError, ValueError):
-            continue
-    return False
+        blender.resolve().relative_to(scmi_app_local_dir().resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def find_blender_executable(progress: ProgressCallback | None = None) -> Path:
+    """Blender for the legacy --bake-with-blender reference bake."""
     # 0. Explicit override for advanced users / development.
     env = os.environ.get("MMDVMDNPC_BLENDER_EXE") or os.environ.get("BLENDER_EXE")
     if env and Path(env).exists():
@@ -2525,12 +2428,7 @@ def find_blender_executable(progress: ProgressCallback | None = None) -> Path:
         emit_progress(progress, f"Using Blender installed by Simple Character Model Importer: {scmi}")
         return scmi
 
-    # 2/3. The Blender bundled with this importer (extracting it once if needed).
-    bundled = bundled_blender_executable(progress)
-    if bundled:
-        return bundled
-
-    # 4. Development fallback: an ordinary system Blender install.
+    # 2. An ordinary system Blender install.
     return detect_system_blender()
 
 
@@ -2615,9 +2513,9 @@ def is_blender_version_supported(version: tuple[int, int, int]) -> bool:
 
 
 def require_supported_blender(blender: Path) -> Path:
-    # A portable Blender we provisioned ourselves is a known-good 4.5.x; skip the
-    # ~1s `blender --version` subprocess for it and only probe unknown installs.
-    if blender_is_trusted_bundled(blender):
+    # The sibling importer's managed portable Blender is a known-good 4.5.x; skip
+    # the ~1s `blender --version` subprocess for it and only probe unknown installs.
+    if blender_is_trusted_install(blender):
         return blender
     version = blender_version(blender)
     if not is_blender_version_supported(version):
@@ -2628,6 +2526,77 @@ def require_supported_blender(blender: Path) -> Path:
             + STEAM_BLENDER_URL
         )
     return blender
+
+
+def _load_vmd_baker():
+    try:
+        from tools import vmd_baker
+    except ModuleNotFoundError:
+        import vmd_baker  # type: ignore[no-redef]
+    return vmd_baker
+
+
+def bake_vmd_native(
+    vmd_path: Path,
+    mmd_model: Path | None = None,
+    frame_start: int = 0,
+    frame_end: int | None = None,
+    output_rotation_json: Path | None = None,
+    progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    disable_foot_ik: bool = False,
+) -> dict:
+    """Bake MMD IK and append transforms in-process (no Blender) and return the
+    parent-corrected rotation document that write_motion_json consumes. The
+    document is also written to `output_rotation_json` when one is given."""
+    if not vmd_path.exists():
+        raise FileNotFoundError(vmd_path)
+    mmd_model = mmd_model or find_default_mmd_model()
+    if not mmd_model.exists():
+        raise FileNotFoundError(f"MMD model not found: {mmd_model}")
+
+    emit_progress(progress, "Starting native motion bake...")
+    started = time.monotonic()
+    emit_progress(progress, f"Importing MMD model: {mmd_model}")
+    bones = parse_pmx_bones(mmd_model)
+    emit_progress(progress, f"Imported MMD model: {mmd_model.name} ({len(bones)} bones)")
+    emit_progress(progress, f"Importing VMD motion: {vmd_path}")
+    parsed = parse_vmd(vmd_path)
+    emit_progress(progress, f"Imported VMD motion: {len(parsed.bone_frames)} bone track(s), max frame {parsed.max_frame}")
+
+    frame_end = parsed.max_frame if frame_end is None else frame_end
+    if frame_end < frame_start:
+        raise ValueError("frame_end must be greater than or equal to frame_start")
+    # A corrupt VMD can report a garbage max frame (the field is a raw u32);
+    # reject an implausibly long range up front with a clear message.
+    if (frame_end - frame_start) > MAX_BAKE_FRAMES:
+        raise ValueError(
+            f"VMD frame range {frame_start}..{frame_end} exceeds the {MAX_BAKE_FRAMES}-frame limit; "
+            "the file may be corrupted, or pass an explicit --frame-end"
+        )
+
+    vmd_baker = _load_vmd_baker()
+    try:
+        document = vmd_baker.bake_motion(
+            bones,
+            parsed,
+            load_bone_mapping(),
+            frame_start,
+            frame_end,
+            model_path=mmd_model,
+            input_vmd=vmd_path.resolve(),
+            disable_ik=disable_foot_ik,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+    except vmd_baker.BakeCancelled as exc:
+        raise RuntimeError("VMD bake was cancelled") from exc
+
+    if output_rotation_json is not None:
+        atomic_write_text(output_rotation_json, json.dumps(document, ensure_ascii=False, separators=(",", ":")))
+        emit_progress(progress, f"Wrote parent-corrected rotation JSON: {output_rotation_json}")
+    emit_progress(progress, f"Native bake finished in {time.monotonic() - started:.1f}s")
+    return document
 
 
 def build_blender_bake_command(
@@ -2729,10 +2698,10 @@ def bake_vmd_with_blender(
     emit_progress(progress, "Starting Blender bake process...")
     started = time.monotonic()
     bake_env = os.environ.copy()
-    mmd_tools_archive = bundled_mmd_tools_archive()
+    mmd_tools_archive = vendored_mmd_tools_archive()
     if mmd_tools_archive:
         bake_env["MMDVMDNPC_MMD_TOOLS_ARCHIVE"] = str(mmd_tools_archive)
-        emit_progress(progress, f"Using bundled mmd_tools archive: {mmd_tools_archive}")
+        emit_progress(progress, f"Using vendored mmd_tools archive: {mmd_tools_archive}")
     process = subprocess.Popen(
         command,
         text=True,
@@ -2973,7 +2942,7 @@ def normalize_motion_meta(meta: dict | None, fallback_display_name: str) -> dict
 
 
 def write_motion_json(
-    rotation_json_path: Path,
+    rotation_source: Path | dict,
     output_dir: Path,
     motion_name_source: Path | str,
     flex_vmd_path: Path | None = None,
@@ -2985,11 +2954,14 @@ def write_motion_json(
     camera_track: dict | None = None,
     meta: dict | None = None,
 ) -> Path:
-    if not rotation_json_path.exists():
-        raise FileNotFoundError(rotation_json_path)
-
-    raw = rotation_json_path.read_text(encoding="utf-8")
-    parsed = json.loads(raw)
+    """Write the GMod motion JSON from a parent-corrected rotation document,
+    given in memory (bake_vmd_native) or as a JSON file path."""
+    if isinstance(rotation_source, dict):
+        parsed = dict(rotation_source)
+    else:
+        if not rotation_source.exists():
+            raise FileNotFoundError(rotation_source)
+        parsed = json.loads(rotation_source.read_text(encoding="utf-8"))
     if parsed.get("format") != "mmd_vmd_npc_parent_corrected_axis_v1":
         raise ValueError(f"unsupported parent-corrected motion JSON format: {parsed.get('format')!r}")
 
@@ -3056,12 +3028,13 @@ def main(argv: list[str]) -> int:
     configure_output_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("vmd", type=Path, nargs="?", help="VMD file to import")
-    parser.add_argument("--cache", action="store_true", help="write compact parent-corrected motion JSON for GMod")
-    parser.add_argument("--bake-with-blender", action="store_true", help="bake MMD IK/constraints and export parent-corrected axis rotations before writing GMod JSON")
-    parser.add_argument("--blender", type=Path, help="override Blender executable path")
-    parser.add_argument("--mmd-model", type=Path, help="PMX/PMD model to load for Blender visual baking")
-    parser.add_argument("--baked-output-dir", type=Path, help="directory for the intermediate baked VMD")
-    parser.add_argument("--output-rotation-json", type=Path, help="override parent-corrected rotation JSON output path")
+    parser.add_argument("--cache", action="store_true", help="bake the VMD and write the compact parent-corrected motion JSON for GMod")
+    parser.add_argument("--bake", action="store_true", help="bake MMD IK/append transforms natively (no Blender) and write the parent-corrected rotation JSON; implied by --cache")
+    parser.add_argument("--bake-with-blender", action="store_true", help="legacy reference bake through Blender + mmd_tools instead of the native baker (requires Blender 4.3+)")
+    parser.add_argument("--blender", type=Path, help="Blender executable for --bake-with-blender")
+    parser.add_argument("--mmd-model", type=Path, help="PMX model to bake on; defaults to the bundled model")
+    parser.add_argument("--baked-output-dir", type=Path, help="directory for intermediate bake output")
+    parser.add_argument("--output-rotation-json", type=Path, help="parent-corrected rotation JSON: output path when baking, or a pre-baked input for --cache")
     parser.add_argument("--flex-vmd", type=Path, action="append", default=[], help="additional facial/flex VMD to merge; may be repeated")
     parser.add_argument("--camera-vmd", type=Path, help="optional camera VMD; exports an entity-anchored camera path for the GMod addon")
     parser.add_argument("--music", type=Path, help="optional music/audio or video file; audio is extracted and converted to GMod MP3 sound")
@@ -3076,7 +3049,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output-dir", type=Path, help="override GMod motion JSON output directory")
     parser.add_argument("--gmod-dir", type=Path, help="override Garry's Mod installation directory")
     parser.add_argument("--print-gmod", action="store_true", help="print the detected Garry's Mod path")
-    parser.add_argument("--print-blender", action="store_true", help="print the detected Blender executable path")
+    parser.add_argument("--print-blender", action="store_true", help="print the Blender executable --bake-with-blender would use")
     parser.add_argument("--debug-retarget", action="store_true", help="legacy binary-cache retarget diagnostic flag")
     args = parser.parse_args(argv)
 
@@ -3091,31 +3064,49 @@ def main(argv: list[str]) -> int:
     if args.install_addon:
         print("Skipped addon install: importer no longer modifies garrysmod/addons. Install or update the addon manually.")
 
-    vmd_for_cache = args.vmd
-    rotation_json_for_cache = args.output_rotation_json
+    if args.bake and args.bake_with_blender:
+        parser.error("choose either --bake or --bake-with-blender")
+    rotation_source: Path | dict | None = None
     if args.bake_with_blender:
         if not args.vmd:
             parser.error("--bake-with-blender requires a VMD file")
-        rotation_json_for_cache = args.output_rotation_json or ((args.baked_output_dir or BAKED_OUTPUT_DIR) / PARENT_CORRECTED_ROTATION_JSON)
-        vmd_for_cache = bake_vmd_with_blender(
+        rotation_source = args.output_rotation_json or ((args.baked_output_dir or BAKED_OUTPUT_DIR) / PARENT_CORRECTED_ROTATION_JSON)
+        baked_vmd = bake_vmd_with_blender(
             args.vmd,
             blender=args.blender,
             mmd_model=args.mmd_model,
             output_dir=args.baked_output_dir,
             frame_start=args.frame_start,
             frame_end=args.frame_end,
-            output_rotation_json=rotation_json_for_cache,
+            output_rotation_json=rotation_source,
             disable_foot_ik=args.disable_foot_ik,
         )
-        print(f"Baked VMD: {vmd_for_cache}")
-        print(f"Parent-corrected rotation JSON: {rotation_json_for_cache}")
+        print(f"Baked VMD: {baked_vmd}")
+        print(f"Parent-corrected rotation JSON: {rotation_source}")
+    elif args.bake or (args.cache and args.vmd and not args.output_rotation_json):
+        if not args.vmd:
+            parser.error("--bake requires a VMD file")
+        rotation_json_out = args.output_rotation_json
+        if rotation_json_out is None and not args.cache:
+            rotation_json_out = (args.baked_output_dir or BAKED_OUTPUT_DIR) / PARENT_CORRECTED_ROTATION_JSON
+        rotation_source = bake_vmd_native(
+            args.vmd,
+            mmd_model=args.mmd_model,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+            output_rotation_json=rotation_json_out,
+            progress=print,
+            disable_foot_ik=args.disable_foot_ik,
+        )
+    elif args.output_rotation_json:
+        rotation_source = args.output_rotation_json
 
     if args.cache:
-        if not rotation_json_for_cache:
-            parser.error("--cache now requires --bake-with-blender or --output-rotation-json")
+        if rotation_source is None:
+            parser.error("--cache requires a VMD file to bake, or --output-rotation-json with a pre-baked rotation JSON")
         output_dir = args.output_dir or (gmod_dir / "garrysmod" / "data" / "mmd_vmd_npc" / "motions")
         music_metadata = None
-        motion_name_source = args.motion_name or vmd_for_cache or rotation_json_for_cache
+        motion_name_source = args.motion_name or args.vmd or args.output_rotation_json
         if args.music:
             music_metadata = convert_music_to_gmod_mp3(args.music, gmod_dir, motion_name_source, vmd_path=args.vmd)
             print(f"Wrote music: {music_metadata['sound']}")
@@ -3125,7 +3116,7 @@ def main(argv: list[str]) -> int:
                 raise FileNotFoundError(f"camera VMD not found: {args.camera_vmd}")
             camera_track = build_camera_track(args.camera_vmd, print)
         output = write_motion_json(
-            rotation_json_for_cache,
+            rotation_source,
             output_dir,
             motion_name_source,
             args.vmd,
@@ -3141,7 +3132,7 @@ def main(argv: list[str]) -> int:
             gma = export_motion_addon_gma(output, music_metadata, gmod_dir, motion_name_source, args.export_addon_gma, print)
             print(f"Wrote GMod addon: {gma}")
 
-    if not args.cache and not args.install_addon and not args.print_gmod and not args.print_blender and not args.bake_with_blender:
+    if not args.cache and not args.install_addon and not args.print_gmod and not args.print_blender and not args.bake and not args.bake_with_blender:
         parser.print_help()
 
     return 0

@@ -2,7 +2,7 @@
 # GMod MMD Motion Importer
 Visit: https://steamcommunity.com/sharedfiles/filedetails/?id=3718373357
 
-Qt-based Windows importer for converting MMD `.vmd` motions into motion JSON files used by the `mmd_vmd_npc` Garry's Mod addon. The importer can preview PMX/VMD (with camera) motion, bake IK through Blender, merge optional face/flex VMDs, convert audio/video to GMod MP3 sound, and optionally package an imported motion as a `.gma` addon.
+Qt-based Windows importer for converting MMD `.vmd` motions into motion JSON files used by the `mmd_vmd_npc` Garry's Mod addon. The importer can preview PMX/VMD (with camera) motion, bake IK and append (付与) transforms natively (no Blender needed), merge optional face/flex VMDs, convert audio/video to GMod MP3 sound, and optionally package an imported motion as a `.gma` addon.
 
 Please Update to the latest version of the motion importer. 
 
@@ -13,7 +13,8 @@ mmd_vmd_npc/                 Garry's Mod addon source
 source_models/mmd_model/     Bundled PMX model and textures used for baking/preview
 tools/import_vmd.py          CLI importer and cache writer
 tools/mmd_vmd_importer_gui.py Qt desktop importer UI
-tools/blender_bake_vmd.py    Blender-side bake/export script
+tools/vmd_baker.py           Native MMD pose baker (FK, append, IK) and GMod transform export
+tools/blender_bake_vmd.py    Legacy Blender-side bake script (optional --bake-with-blender only)
 tools/preview/               OpenGL PMX/VMD preview renderer
 tools/i18n/                  Importer UI translation files
 tools/build_importer_exe.ps1 PyInstaller build script
@@ -24,11 +25,10 @@ tools/requirements_importer.txt Python dependencies
 
 - Windows 10/11, 64-bit.
 - Python 3.10 or newer, 64-bit. Python from python.org is recommended for PyInstaller builds.
-- Blender 4.3 or newer.
 - Garry's Mod installed through Steam.
 - PowerShell for the EXE build script.
 
-The importer auto-detects Steam Garry's Mod and Steam Blender when possible. Blender is still required even when using the packaged EXE, because the importer runs Blender in the background to bake MMD IK/constraints.
+The importer auto-detects Steam Garry's Mod when possible. Blender is not required: MMD IK and append transforms are baked in-process (see [Motion Baking](#motion-baking)).
 
 ## Set Up From Source
 
@@ -94,7 +94,7 @@ The build script bundles:
 
 - `tools/mmd_vmd_importer_gui.py`
 - `tools/import_vmd.py`
-- `tools/blender_bake_vmd.py`
+- `tools/vmd_baker.py`
 - `tools/preview/`
 - `tools/i18n/`
 - `tools/assets/`
@@ -123,28 +123,26 @@ Imported music is written to:
 <GarrysMod>/garrysmod/sound/mmd_vmd_npc/music/
 ```
 
-The UI remembers Blender path, Garry's Mod path, language choice, and recent inputs between sessions.
+The UI remembers Garry's Mod path, language choice, and recent inputs between sessions.
 
 ## CLI Usage
 
-Print detected paths:
+Print the detected Garry's Mod path:
 
 ```powershell
 python tools/import_vmd.py --print-gmod
-python tools/import_vmd.py --print-blender
 ```
 
 Bake and import a body VMD:
 
 ```powershell
-python tools/import_vmd.py "motions\dance.vmd" --bake-with-blender --cache
+python tools/import_vmd.py "motions\dance.vmd" --cache
 ```
 
 Import with extra flex VMDs and music:
 
 ```powershell
 python tools/import_vmd.py "motions\dance.vmd" `
-  --bake-with-blender `
   --cache `
   --flex-vmd "motions\face.vmd" `
   --flex-vmd "motions\mouth.vmd" `
@@ -153,13 +151,11 @@ python tools/import_vmd.py "motions\dance.vmd" `
   --motion-name "My Dance"
 ```
 
-Override detected paths:
+Override the detected Garry's Mod path:
 
 ```powershell
 python tools/import_vmd.py "motions\dance.vmd" `
-  --bake-with-blender `
   --cache `
-  --blender "C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe" `
   --gmod-dir "H:\SteamLibrary\steamapps\common\GarrysMod"
 ```
 
@@ -167,23 +163,37 @@ Also export the imported motion as a `.gma`:
 
 ```powershell
 python tools/import_vmd.py "motions\dance.vmd" `
-  --bake-with-blender `
   --cache `
   --motion-name "My Dance" `
   --export-addon-gma "dist\MyDance.gma"
 ```
 
-## Blender And MMD Tools
+Only bake, writing the intermediate parent-corrected rotation JSON:
 
-The bake helper imports the bundled PMX model, imports the VMD motion, bakes pose animation with visual keying, exports a baked VMD, then exports parent-corrected JSON data for GMod.
+```powershell
+python tools/import_vmd.py "motions\dance.vmd" --bake --output-rotation-json "build\dance_rotations.json"
+```
 
-If `mmd_tools` is not available in Blender, the helper tries Blender 4.x extension module names and then attempts to install the official MMD Tools extension from:
+## Motion Baking
+
+`tools/vmd_baker.py` evaluates the body VMD on the bundled PMX skeleton the way MMD does and exports the per-frame GMod bone transforms in the parent-corrected JSON format the addon reads. Frames are independent, so they are evaluated in batches with NumPy; a typical dance bakes in a few seconds.
+
+- Bone keys use the VMD bezier curves, with rotations interpolated by slerp.
+- Append (付与) rotation/translation bones (shoulder cancel, twist sub-bones, D bones) are evaluated in PMX transform order.
+- Standard leg IK chains (knee hinge + thigh) are solved in closed form, so feet reach their IK targets even when crouching from a straight leg; other IK chains use MMD-style CCD with angle limits. IK on/off keys in the VMD apply per frame, and `--disable-foot-ik` turns all IK off.
+
+Differences from the previous Blender bake:
+
+- The body motion is no longer one frame late relative to the music, camera, and facial tracks (mmd_tools placed VMD frame N at Blender frame N+1; the legacy `--bake-with-blender` path is fixed too).
+- IK on/off keys after the first frame are honoured; the Blender bake kept the first frame's IK state for the whole motion.
+- Knees keep the model's minimum bend (0.5° on the bundled model), as in MMD.
+- No intermediate baked VMD is written.
+
+The previous Blender + MMD Tools bake is still available from source as a reference with `--bake-with-blender` (not bundled in the EXE). It needs Blender 4.3 or newer, auto-detected or passed with `--blender`; `--print-blender` shows which install it would use. If MMD Tools is not available in that Blender, the helper installs the vendored `tools/blender_addons` archive, then tries the official extension from:
 
 ```text
 https://extensions.blender.org/add-ons/mmd-tools/
 ```
-
-Baking requires Blender 4.3 or newer. Blender 4.2 or older is rejected.
 
 ## Troubleshooting
 
@@ -209,14 +219,10 @@ powershell -ExecutionPolicy Bypass -File tools/build_importer_exe.ps1 -NoBundled
 
 The user will need ffmpeg on `PATH` for music/video conversion.
 
-### Blender cannot import MMD files
-
-Open Blender once and verify MMD Tools can be enabled. The importer can attempt automatic extension install, but local Blender permissions or network restrictions can block it.
-
 ### Garry's Mod is not detected
 
 Pass the path manually in the UI, or use CLI:
 
 ```powershell
-python tools/import_vmd.py "motions\dance.vmd" --gmod-dir "H:\SteamLibrary\steamapps\common\GarrysMod" --bake-with-blender --cache
+python tools/import_vmd.py "motions\dance.vmd" --gmod-dir "H:\SteamLibrary\steamapps\common\GarrysMod" --cache
 ```

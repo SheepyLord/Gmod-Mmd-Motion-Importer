@@ -313,6 +313,9 @@ def import_model(model_path: Path) -> bpy.types.Object:
 
 def import_motion(armature: bpy.types.Object, vmd_path: Path) -> None:
     set_active(armature)
+    # mmd_tools inserts VMD frame N at scene.frame_current + N; a factory scene
+    # sits on frame 1, which made every bake one frame late.
+    bpy.context.scene.frame_current = 0
     print(f"Importing VMD motion: {vmd_path}")
     call_operator(bpy.ops.mmd_tools.import_vmd, filepath=str(vmd_path))
     print(f"Imported VMD motion: {vmd_path}")
