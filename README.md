@@ -120,6 +120,14 @@ The preview view follows the character, so motions that travel or carry stage pl
 
 Scene cuts need no option. When a motion moves the character to another spot in a single frame (Project Diva PV conversions do this at most camera cuts), the addon plays the jump as a cut. It holds the pose before the cut until the cut's frame instead of sliding the dancer across the stage. It also announces the jump to hair and cloth physics, which Model Hotloader then carries across the cut instead of dragging the hair after the body. The bake log lists the cuts it found. The addon finds the same frames in the built animation, so motions imported before this change get the fix too.
 
+In game, the tool's Build/Playback tab has **Stage placement and movement** options. They apply when playback starts and change only the character's horizontal travel:
+
+- **Stage placement jumps kept (%)**: 100 keeps the jumps to another spot at scene cuts as authored. 0 removes them, so the character keeps dancing where it stood. Values between shorten the jumps. Without the jumps, the walking of each shot adds up and the character can drift far, so pair this with the movement limit. For several dancers in formation, keep 100.
+- **Movement range (%)**: shrinks how far the dance moves the character from where it starts; 0 dances on the spot. Only the dance's path (a one-second moving average) is scaled, not the hip sway around it, so the dance keeps its feel.
+- **Movement limit (units, 0 = none)**: keeps the character within this distance of where the dance starts, easing in near the edge instead of stopping as if at a wall.
+
+An imported camera moves with the character, so it keeps framing the character.
+
 The importer writes motion JSON to:
 
 ```text

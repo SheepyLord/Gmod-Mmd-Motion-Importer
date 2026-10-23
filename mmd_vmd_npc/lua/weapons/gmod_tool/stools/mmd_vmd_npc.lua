@@ -123,6 +123,9 @@ TOOL.ClientConVar = {
     music_range = "1500",
     music_fade = "300",
     loop_playback = "0",
+    stage_jumps = "100",
+    movement_scale = "100",
+    movement_limit = "0",
     camera_auto = "1",
     fast_build = "1",
     build_frames_per_batch = "64",
@@ -1042,6 +1045,14 @@ function TOOL.BuildCPanel(panel)
     add_slider(playbackTab, L("mmd_vmd_npc.ui.pelvis_z_offset"), "mmd_vmd_npc_pelvis_z_offset", -16, 16, 1)
     add_slider(playbackTab, L("mmd_vmd_npc.ui.thirdperson_distance"), "mmd_vmd_npc_thirdperson_distance", 40, 260, 0)
     add_slider(playbackTab, L("mmd_vmd_npc.ui.thirdperson_height"), "mmd_vmd_npc_thirdperson_height", -20, 90, 0)
+
+    section(playbackTab, L("mmd_vmd_npc.ui.stage_movement"), Color(120, 220, 190))
+    add_slider(playbackTab, L("mmd_vmd_npc.ui.stage_jumps"), "mmd_vmd_npc_stage_jumps", 0, 100, 0)
+    playbackTab:Help(L("mmd_vmd_npc.ui.stage_jumps_help"))
+    add_slider(playbackTab, L("mmd_vmd_npc.ui.movement_scale"), "mmd_vmd_npc_movement_scale", 0, 100, 0)
+    playbackTab:Help(L("mmd_vmd_npc.ui.movement_scale_help"))
+    add_slider(playbackTab, L("mmd_vmd_npc.ui.movement_limit"), "mmd_vmd_npc_movement_limit", 0, MMDVMDNPC.MaxMovementLimit or 2000, 0)
+    playbackTab:Help(L("mmd_vmd_npc.ui.movement_limit_help"))
 
     section(motionTab, L("mmd_vmd_npc.ui.display_playback"), Color(150, 210, 255))
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.hide_hud"), "mmd_vmd_npc_hide_hud", L("mmd_vmd_npc.ui.hide_hud_help"))

@@ -424,6 +424,31 @@ local function apply_camera_follow(track, pivot, camPos, camAng, vfov, cutSnap)
     return follow_corrected_angles(camAng, track.followPitch, track.followYaw)
 end
 
+-- Where the stage-placement and movement options moved the dancer, from the
+-- server's mmdvmd_camera_shift (MMDVMDNPC.BuiltTravelShiftKeys): the camera
+-- adds it so it keeps framing the dancer instead of the authored spot. Keyed
+-- by anchor entity; a shift applies only to the camera transfer it was sent with.
+MMDVMDNPC.CameraShifts = MMDVMDNPC.CameraShifts or {}
+
+local function camera_shift_at(track, frame)
+    local shift = MMDVMDNPC.CameraShifts[track.entIndex]
+    if not shift or shift.transferID ~= track.transferID then return nil end
+    local keys = shift.keys
+    if #keys <= 0 then return nil end
+    if frame <= keys[1].frame then return keys[1].x, keys[1].y end
+    if frame >= keys[#keys].frame then return keys[#keys].x, keys[#keys].y end
+    local lo, hi = 1, #keys
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) * 0.5)
+        if keys[mid].frame <= frame then lo = mid else hi = mid end
+    end
+    local a, b = keys[lo], keys[hi]
+    -- Keys one frame apart around a jump are a scene cut: hold until its frame, as the body does.
+    if b.frame - a.frame <= 1 and math.abs(b.x - a.x) + math.abs(b.y - a.y) > 2 then return a.x, a.y end
+    local t = (frame - a.frame) / math.max(1, b.frame - a.frame)
+    return a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t
+end
+
 local function camera_view_for(track, anchorEnt, frame)
     local x, y, z, p, yw, r, fov = MMDVMDNPC.SampleCameraTrack(track, frame)
     if x == nil then return nil end
@@ -443,6 +468,12 @@ local function camera_view_for(track, anchorEnt, frame)
 
     local anchorPos, anchorAng = anchor_transform(anchorEnt, track)
     local worldPos, worldAng = LocalToWorld(Vector(x, y, z), Angle(p, yw, r), anchorPos, anchorAng)
+    local shiftX, shiftY = camera_shift_at(track, frame)
+    if shiftX then
+        local shift = Vector(shiftX, shiftY, 0)
+        shift:Rotate(anchorAng)
+        worldPos = worldPos + shift
+    end
     local pivot = camera_pivot(anchorEnt)
     worldPos, fov = apply_camera_collision(anchorEnt, pivot, worldPos, fov)
     if followActive then
@@ -611,6 +642,7 @@ net.Receive("mmdvmd_camera_begin", function()
     local keyCount = net.ReadUInt(16)
 
     local track = {
+        transferID = transferID,
         entIndex = entIndex,
         motionID = motionID,
         anchorPos = anchorPos,
@@ -695,9 +727,21 @@ net.Receive("mmdvmd_camera_keys", function()
     end
 end)
 
+net.Receive("mmdvmd_camera_shift", function()
+    local entIndex = net.ReadUInt(16)
+    local transferID = net.ReadUInt(32)
+    local count = net.ReadUInt(16)
+    local keys = {}
+    for i = 1, count do
+        keys[i] = { frame = net.ReadUInt(32), x = net.ReadFloat(), y = net.ReadFloat() }
+    end
+    MMDVMDNPC.CameraShifts[entIndex] = { transferID = transferID, keys = keys }
+end)
+
 net.Receive("mmdvmd_camera_stop", function()
     local entIndex = net.ReadUInt(16)
     MMDVMDNPC.CameraTracks[entIndex] = nil
+    MMDVMDNPC.CameraShifts[entIndex] = nil
     cancel_pending_transfers_for(entIndex)
     if MMDVMDNPC.CameraAnimActive and MMDVMDNPC.CameraAnimEntIndex == entIndex then
         MMDVMDNPC.DeactivateCameraAnim()

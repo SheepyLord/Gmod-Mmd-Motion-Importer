@@ -59,16 +59,18 @@ MMDVMDNPC.CutRatio = 4
 MMDVMDNPC.CutNeighbours = 3
 MMDVMDNPC.PoseCutNW2 = "MMDVMDNPCPoseCut"
 
+local pelvisCache = setmetatable({}, { __mode = "k" })
 local poseCutCache = setmetatable({}, { __mode = "k" })
+local travelCache = setmetatable({}, { __mode = "k" })
 
--- Set of the absolute frames that start after a cut, for a built animation
--- whose pelvis is pelvisBone; cached per built table.
-function MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
-    if not istable(built) or not isnumber(pelvisBone) or pelvisBone < 0 then return {} end
-    local cached = poseCutCache[built]
-    if cached and cached.bone == pelvisBone then return cached.cuts end
+-- Pelvis position per built frame ({x, y, z} arrays like built.frames, Source
+-- units in the dancer's start frame): x and y are the dance's horizontal
+-- travel, z its height. Cached per built table.
+local function built_pelvis(built, pelvisBone)
+    local cached = pelvisCache[built]
+    if cached and cached.bone == pelvisBone then return cached end
 
-    local steps, slot, px, py, pz = {}, nil, nil, nil, nil
+    local xs, ys, zs, slot = {}, {}, {}, nil
     for index, frame in ipairs(built.frames or {}) do
         local bones = istable(frame) and frame.bones or {}
         local entry = slot and bones[slot] or nil
@@ -81,11 +83,26 @@ function MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
                 end
             end
         end
-        local x = tonumber(entry and entry[5]) or 0
-        local y = tonumber(entry and entry[6]) or 0
-        local z = tonumber(entry and entry[7]) or 0
-        steps[index] = px and math.sqrt((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2) or 0
-        px, py, pz = x, y, z
+        xs[index] = tonumber(entry and entry[5]) or 0
+        ys[index] = tonumber(entry and entry[6]) or 0
+        zs[index] = tonumber(entry and entry[7]) or 0
+    end
+    cached = { bone = pelvisBone, x = xs, y = ys, z = zs }
+    pelvisCache[built] = cached
+    return cached
+end
+
+-- Set of the absolute frames that start after a cut, for a built animation
+-- whose pelvis is pelvisBone; cached per built table.
+function MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
+    if not istable(built) or not isnumber(pelvisBone) or pelvisBone < 0 then return {} end
+    local cached = poseCutCache[built]
+    if cached and cached.bone == pelvisBone then return cached.cuts end
+
+    local pelvis = built_pelvis(built, pelvisBone)
+    local xs, ys, zs, steps = pelvis.x, pelvis.y, pelvis.z, {}
+    for index = 1, #xs do
+        steps[index] = index > 1 and math.sqrt((xs[index] - xs[index - 1]) ^ 2 + (ys[index] - ys[index - 1]) ^ 2 + (zs[index] - zs[index - 1]) ^ 2) or 0
     end
 
     local cuts, first, span, around = {}, math.floor(tonumber(built.frame_start) or 0), MMDVMDNPC.CutNeighbours, {}
@@ -104,6 +121,150 @@ function MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
     end
     poseCutCache[built] = { bone = pelvisBone, cuts = cuts }
     return cuts
+end
+
+-- Playback options that reshape the dancer's horizontal travel (heights stay
+-- as built; the importer's "Unify ground height" cancels stage heights):
+--   stage jumps kept, percent: 100 keeps each scene cut's jump to another spot
+--     as authored, 0 removes it so the dance goes on from where it was,
+--     values between shorten it;
+--   movement range, percent: shrinks the remaining travel around the spot
+--     where the dance starts (0 dances on the spot);
+--   movement limit, Source units: a soft bound on the distance from that
+--     spot (0 = none), eased in like tanh rather than stopping at a wall.
+-- Range and limit act on the dance's path, a moving average over about a
+-- second (TravelPathHalfWindow frames either side, never across a cut), not
+-- on the hip sway around it: scaling the sway too stiffens the dance and
+-- slides the feet even when the dancer stays in place.
+MMDVMDNPC.DefaultStageJumps = 100
+MMDVMDNPC.DefaultMovementScale = 100
+MMDVMDNPC.DefaultMovementLimit = 0
+MMDVMDNPC.MaxMovementLimit = 2000
+MMDVMDNPC.TravelPathHalfWindow = 15
+
+-- Centred moving average of values[from..to] into out[from..to], the window
+-- shortened at the ends of the stretch.
+local function smooth_stretch(values, from, to, half, out)
+    local prefix = { [from - 1] = 0 }
+    for i = from, to do prefix[i] = prefix[i - 1] + values[i] end
+    for i = from, to do
+        local a, b = math.max(from, i - half), math.min(to, i + half)
+        out[i] = (prefix[b] - prefix[a - 1]) / (b - a + 1)
+    end
+end
+
+function MMDVMDNPC.NormalizeTravelSettings(stageJumps, movementScale, movementLimit)
+    return math.Clamp(tonumber(stageJumps) or MMDVMDNPC.DefaultStageJumps, 0, 100),
+        math.Clamp(tonumber(movementScale) or MMDVMDNPC.DefaultMovementScale, 0, 100),
+        math.Clamp(tonumber(movementLimit) or MMDVMDNPC.DefaultMovementLimit, 0, MMDVMDNPC.MaxMovementLimit)
+end
+
+-- The pelvis horizontal travel per built frame under those options, as
+-- {x = {...}, y = {...}} indexed like built.frames, to use instead of each
+-- frame's own x and y; nil when the options leave the travel as built. The
+-- start spot (frame 1) never moves. Cached per built table and options.
+function MMDVMDNPC.BuiltTravel(built, pelvisBone, stageJumps, movementScale, movementLimit)
+    if not istable(built) or not isnumber(pelvisBone) or pelvisBone < 0 then return nil end
+    stageJumps, movementScale, movementLimit = MMDVMDNPC.NormalizeTravelSettings(stageJumps, movementScale, movementLimit)
+    if stageJumps >= 100 and movementScale >= 100 and movementLimit <= 0 then return nil end
+    local key = table.concat({ pelvisBone, stageJumps, movementScale, movementLimit }, "|")
+    local cached = travelCache[built]
+    if cached and cached.key == key then return cached.travel end
+
+    local pelvis = built_pelvis(built, pelvisBone)
+    local xs, ys = pelvis.x, pelvis.y
+    local n = #xs
+    if n <= 0 then return nil end
+    local cuts = MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
+    local first = math.floor(tonumber(built.frame_start) or 0)
+    local dropped, scale, limit = 1 - stageJumps / 100, movementScale / 100, movementLimit
+
+    -- The travel with each cut's jump shortened by `dropped`.
+    local rx, ry, removedX, removedY = {}, {}, 0, 0
+    for index = 1, n do
+        if index > 1 and cuts[first + index - 1] then
+            removedX = removedX + dropped * (xs[index] - xs[index - 1])
+            removedY = removedY + dropped * (ys[index] - ys[index - 1])
+        end
+        rx[index], ry[index] = xs[index] - removedX, ys[index] - removedY
+    end
+    -- Its path, smoothed within each stretch between cuts so a jump that is
+    -- kept stays a jump instead of turning into a glide.
+    local px, py = rx, ry
+    if scale < 1 or limit > 0 then
+        px, py = {}, {}
+        local from = 1
+        for index = 2, n + 1 do
+            if index > n or cuts[first + index - 1] then
+                smooth_stretch(rx, from, index - 1, MMDVMDNPC.TravelPathHalfWindow, px)
+                smooth_stretch(ry, from, index - 1, MMDVMDNPC.TravelPathHalfWindow, py)
+                from = index
+            end
+        end
+    end
+
+    local startX, startY = px[1], py[1]
+    local outX, outY = {}, {}
+    for index = 1, n do
+        local dx = (px[index] - startX) * scale
+        local dy = (py[index] - startY) * scale
+        if limit > 0 then
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance > 1e-6 then
+                -- tanh, written out: LuaJIT has math.tanh, Lua 5.3+ does not.
+                local e = math.exp(-2 * distance / limit)
+                local bounded = limit * (1 - e) / (1 + e)
+                dx, dy = dx * bounded / distance, dy * bounded / distance
+            end
+        end
+        -- The sway around the path is kept as built.
+        outX[index] = startX + dx + rx[index] - px[index]
+        outY[index] = startY + dy + ry[index] - py[index]
+    end
+    local travel = { x = outX, y = outY }
+    travelCache[built] = { key = key, travel = travel }
+    return travel
+end
+
+-- What those options move the dancer by, per frame: (adjusted - built) travel
+-- in the dance's start frame, as compact keys {frame, dx, dy} (absolute frames)
+-- that linear interpolation reproduces within `tolerance` Source units, with
+-- the two frames around each jump kept so a sampler can hold across it. The
+-- imported camera adds it so it keeps framing the dancer. nil when no travel.
+function MMDVMDNPC.BuiltTravelShiftKeys(built, pelvisBone, travel, tolerance)
+    if not istable(travel) then return nil end
+    local pelvis = built_pelvis(built, pelvisBone)
+    local n = math.min(#pelvis.x, #travel.x)
+    if n <= 0 then return nil end
+    local first = math.floor(tonumber(built.frame_start) or 0)
+    local sx, sy = {}, {}
+    for index = 1, n do
+        sx[index], sy[index] = travel.x[index] - pelvis.x[index], travel.y[index] - pelvis.y[index]
+    end
+    tolerance = math.max(0.01, tonumber(tolerance) or 0.5)
+    local maxSpan = 60
+    local keys = { { first, sx[1], sy[1] } }
+    local anchor = 1
+    for index = 3, n do
+        local fits = index - anchor <= maxSpan
+        if fits then
+            for i = anchor + 1, index - 1 do
+                local t = (i - anchor) / (index - anchor)
+                local ex = sx[anchor] + (sx[index] - sx[anchor]) * t - sx[i]
+                local ey = sy[anchor] + (sy[index] - sy[anchor]) * t - sy[i]
+                if ex * ex + ey * ey > tolerance * tolerance then
+                    fits = false
+                    break
+                end
+            end
+        end
+        if not fits then
+            anchor = index - 1
+            keys[#keys + 1] = { first + anchor - 1, sx[anchor], sy[anchor] }
+        end
+    end
+    if n > 1 then keys[#keys + 1] = { first + n - 1, sx[n], sy[n] } end
+    return keys
 end
 
 MMDVMDNPC.ForwardReferenceSequenceNames = {
@@ -516,6 +677,13 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.ui.music_range_help"] = "Music plays at full volume within the range (source units), then drops sharply to silence across the fade-out distance.",
     ["mmd_vmd_npc.ui.loop_playback"] = "Loop animation and music",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "When enabled, the animation restarts from the first frame and imported music restarts when the motion ends.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "Stage placement and movement",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "Stage placement jumps kept (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Project Diva and other PV motions move the character to another spot at camera cuts. 100 keeps these jumps as authored, 0 removes them so the character keeps dancing where it stood, and values in between shorten them. Without the jumps the walking of each shot adds up and the character can drift far, so pair this with the movement limit. An imported camera follows the character.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "Movement range (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "How far the dance moves the character from where it starts: 100 as authored, 50 half as far, 0 dances on the spot.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "Movement limit (units, 0 = none)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "Keeps the character within this distance of where the dance starts, slowing down near the edge instead of stopping as if at a wall. A player is about 72 units tall. These options apply when playback starts.",
     ["mmd_vmd_npc.ui.column.motion"] = "Motion",
     ["mmd_vmd_npc.ui.column.duration"] = "Duration",
     ["mmd_vmd_npc.ui.column.addon"] = "From Addon",
@@ -889,6 +1057,13 @@ MMDVMDNPC.I18N.zh = merge_i18n({
     ["mmd_vmd_npc.ui.music_range_help"] = "在范围（源引擎单位）内音乐保持全音量，超出后在衰减距离内急剧降至静音。",
     ["mmd_vmd_npc.ui.loop_playback"] = "循环动画和音乐",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "启用后，动作结束时会从第一帧重新播放，并重新开始导入的音乐。",
+    ["mmd_vmd_npc.ui.stage_movement"] = "舞台站位与移动",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "保留舞台站位跳跃 (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Project Diva 等 PV 动作会在镜头切换时把角色移到舞台上的另一个位置。100 按原样保留这些跳跃，0 将其移除，让角色在原地继续跳舞，介于两者之间的值会缩短跳跃。去掉跳跃后，各镜头中的走动会累加，角色可能走得很远，建议同时设置移动限制。导入的镜头会跟随角色。",
+    ["mmd_vmd_npc.ui.movement_scale"] = "移动范围 (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "舞蹈让角色离开起始位置的距离：100 为原样，50 为一半，0 为原地跳舞。",
+    ["mmd_vmd_npc.ui.movement_limit"] = "移动限制（单位，0 = 不限制）",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "让角色保持在距舞蹈起始位置这个距离以内，接近边缘时逐渐减速，而不是像撞墙一样突然停下。玩家身高约 72 单位。这些选项在开始播放时生效。",
     ["mmd_vmd_npc.ui.column.motion"] = "动作",
     ["mmd_vmd_npc.ui.column.duration"] = "时长",
     ["mmd_vmd_npc.ui.column.addon"] = "来自插件",
@@ -1253,6 +1428,13 @@ MMDVMDNPC.I18N.ja = merge_i18n({
     ["mmd_vmd_npc.ui.music_range_help"] = "範囲（ソースユニット）内では音楽はフル音量で再生され、超えるとフェード距離で急激に無音になります。",
     ["mmd_vmd_npc.ui.loop_playback"] = "アニメーションと音楽をループ",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "有効にすると、モーション終了時に最初のフレームから再開し、インポート音楽も再スタートします。",
+    ["mmd_vmd_npc.ui.stage_movement"] = "ステージの立ち位置と移動",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "立ち位置ジャンプの保持率 (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Project Diva などの PV モーションは、カメラのカットでキャラクターをステージ上の別の位置へ移動させます。100 はジャンプをそのまま残し、0 は取り除いてその場で踊り続けさせ、中間の値はジャンプを短くします。ジャンプを取り除くと各カットでの移動が積み重なり、キャラクターが遠くまで移動することがあるため、移動制限と併用してください。インポートしたカメラはキャラクターに追従します。",
+    ["mmd_vmd_npc.ui.movement_scale"] = "移動範囲 (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "ダンスがキャラクターを開始位置からどれだけ移動させるか：100 はそのまま、50 は半分、0 はその場で踊ります。",
+    ["mmd_vmd_npc.ui.movement_limit"] = "移動制限（単位、0 = 無制限）",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "ダンスの開始位置からこの距離以内にキャラクターを保ちます。壁に当たったように止まるのではなく、端に近づくにつれて減速します。プレイヤーの身長は約 72 単位です。これらの設定は再生開始時に適用されます。",
     ["mmd_vmd_npc.ui.column.motion"] = "モーション",
     ["mmd_vmd_npc.ui.column.duration"] = "長さ",
     ["mmd_vmd_npc.ui.column.addon"] = "アドオン由来",
@@ -1559,6 +1741,13 @@ MMDVMDNPC.I18N.ko = merge_i18n({
     ["mmd_vmd_npc.ui.music_volume"] = "음악 음량",
     ["mmd_vmd_npc.ui.loop_playback"] = "애니메이션과 음악 반복",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "켜면 모션이 끝날 때 첫 프레임부터 다시 재생되고 가져온 음악도 다시 시작됩니다.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "무대 위치와 이동",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "무대 위치 점프 유지 (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Project Diva 등 PV 모션은 카메라 컷마다 캐릭터를 무대의 다른 위치로 옮깁니다. 100은 이 점프를 그대로 두고, 0은 점프를 없애 캐릭터가 서 있던 자리에서 계속 춤추게 하며, 그 사이 값은 점프를 줄입니다. 점프를 없애면 각 컷의 이동이 누적되어 캐릭터가 멀리 갈 수 있으니 이동 제한과 함께 사용하세요. 가져온 카메라는 캐릭터를 따라갑니다.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "이동 범위 (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "춤이 캐릭터를 시작 위치에서 얼마나 멀리 이동시키는지: 100은 원본 그대로, 50은 절반, 0은 제자리에서 춤춥니다.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "이동 제한 (단위, 0 = 없음)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "캐릭터를 춤이 시작된 위치에서 이 거리 안에 머물게 하며, 벽에 부딪힌 듯 멈추지 않고 가장자리에 가까워질수록 느려집니다. 플레이어의 키는 약 72 단위입니다. 이 옵션은 재생을 시작할 때 적용됩니다.",
     ["mmd_vmd_npc.ui.column.motion"] = "모션",
     ["mmd_vmd_npc.ui.column.duration"] = "길이",
     ["mmd_vmd_npc.ui.column.addon"] = "애드온 제공",
@@ -1932,6 +2121,13 @@ MMDVMDNPC.I18N.fr = merge_i18n({
     ["mmd_vmd_npc.ui.music_volume"] = "Volume musique",
     ["mmd_vmd_npc.ui.loop_playback"] = "Boucler animation et musique",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "Si activé, l'animation repart de la première image et la musique importée redémarre à la fin du mouvement.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "Placement sur scène et déplacement",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "Sauts de placement conservés (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Les motions Project Diva et d'autres PV déplacent le personnage vers un autre endroit de la scène à chaque changement de plan. 100 garde ces sauts tels quels, 0 les supprime pour que le personnage continue de danser là où il se trouvait, et les valeurs intermédiaires les raccourcissent. Sans les sauts, les déplacements de chaque plan s'additionnent et le personnage peut s'éloigner beaucoup : associez cette option à la limite de déplacement. La caméra importée suit le personnage.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "Amplitude du déplacement (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "Distance à laquelle la danse éloigne le personnage de son point de départ : 100 tel quel, 50 à moitié, 0 danse sur place.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "Limite de déplacement (unités, 0 = aucune)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "Garde le personnage à cette distance au plus de son point de départ, en ralentissant près du bord au lieu de s'arrêter net comme contre un mur. Un joueur mesure environ 72 unités. Ces options s'appliquent au début de la lecture.",
     ["mmd_vmd_npc.ui.column.motion"] = "Mouvement",
     ["mmd_vmd_npc.ui.column.duration"] = "Durée",
     ["mmd_vmd_npc.ui.column.addon"] = "Depuis l'addon",
@@ -2287,6 +2483,13 @@ MMDVMDNPC.I18N.ru = merge_i18n({
     ["mmd_vmd_npc.ui.music_volume"] = "Громкость музыки",
     ["mmd_vmd_npc.ui.loop_playback"] = "Повторять анимацию и музыку",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "Если включено, анимация начнется с первого кадра, а импортированная музыка перезапустится в конце движения.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "Позиция на сцене и перемещение",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "Сохранение скачков по сцене (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Движения Project Diva и других PV при смене кадра переносят персонажа в другое место сцены. 100 сохраняет эти скачки как есть, 0 убирает их, и персонаж продолжает танцевать там, где стоял; промежуточные значения сокращают скачки. Без скачков перемещения каждого кадра складываются, и персонаж может уйти далеко, поэтому используйте эту настройку вместе с пределом перемещения. Импортированная камера следует за персонажем.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "Дальность перемещения (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "Насколько далеко танец уводит персонажа от начальной точки: 100 — как задумано, 50 — вдвое ближе, 0 — танец на месте.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "Предел перемещения (единицы, 0 = нет)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "Удерживает персонажа в пределах этого расстояния от начальной точки танца, плавно замедляя у края, а не останавливая резко, как у стены. Рост игрока — около 72 единиц. Параметры применяются при запуске воспроизведения.",
     ["mmd_vmd_npc.ui.column.motion"] = "Движение",
     ["mmd_vmd_npc.ui.column.duration"] = "Длительность",
     ["mmd_vmd_npc.ui.column.addon"] = "Из аддона",
@@ -2651,6 +2854,13 @@ MMDVMDNPC.I18N.ar = merge_i18n({
     ["mmd_vmd_npc.ui.music_volume"] = "مستوى الموسيقى",
     ["mmd_vmd_npc.ui.loop_playback"] = "تكرار الحركة والموسيقى",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "عند التفعيل، تبدأ الحركة من الإطار الأول من جديد وتُعاد الموسيقى المستوردة عند انتهاء الحركة.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "موضع المسرح والحركة",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "الاحتفاظ بقفزات موضع المسرح (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "تنقل حركات Project Diva وغيرها من حركات PV الشخصية إلى مكان آخر على المسرح عند كل قطع للكاميرا. القيمة 100 تُبقي هذه القفزات كما هي، والقيمة 0 تزيلها فتواصل الشخصية الرقص حيث كانت، والقيم بينهما تقصّرها. من دون القفزات تتراكم حركة كل لقطة وقد تبتعد الشخصية كثيرًا، لذا استخدم هذا الخيار مع حد الحركة. الكاميرا المستوردة تتبع الشخصية.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "مدى الحركة (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "مقدار ابتعاد الشخصية عن نقطة بدء الرقصة: 100 كما هو، و50 نصف المسافة، و0 رقص في المكان.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "حد الحركة (وحدات، 0 = بلا حد)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "يُبقي الشخصية ضمن هذه المسافة من نقطة بدء الرقصة، مع إبطاء تدريجي قرب الحافة بدلًا من التوقف المفاجئ كأنها اصطدمت بجدار. طول اللاعب نحو 72 وحدة. تُطبَّق هذه الخيارات عند بدء التشغيل.",
     ["mmd_vmd_npc.ui.column.motion"] = "الحركة",
     ["mmd_vmd_npc.ui.column.duration"] = "المدة",
     ["mmd_vmd_npc.ui.column.addon"] = "من الإضافة",
@@ -3024,6 +3234,13 @@ MMDVMDNPC.I18N.es = merge_i18n({
     ["mmd_vmd_npc.ui.music_volume"] = "Volumen de música",
     ["mmd_vmd_npc.ui.loop_playback"] = "Repetir animación y música",
     ["mmd_vmd_npc.ui.loop_playback_help"] = "Si está activado, la animación vuelve al primer fotograma y la música importada se reinicia cuando termina el movimiento.",
+    ["mmd_vmd_npc.ui.stage_movement"] = "Posición en el escenario y movimiento",
+    ["mmd_vmd_npc.ui.stage_jumps"] = "Saltos de posición conservados (%)",
+    ["mmd_vmd_npc.ui.stage_jumps_help"] = "Las motions de Project Diva y otros PV mueven al personaje a otro punto del escenario en cada corte de cámara. 100 conserva esos saltos tal cual, 0 los elimina para que el personaje siga bailando donde estaba, y los valores intermedios los acortan. Sin los saltos, el desplazamiento de cada plano se acumula y el personaje puede alejarse mucho, así que combínalo con el límite de movimiento. La cámara importada sigue al personaje.",
+    ["mmd_vmd_npc.ui.movement_scale"] = "Rango de movimiento (%)",
+    ["mmd_vmd_npc.ui.movement_scale_help"] = "Cuánto aleja el baile al personaje de su punto de inicio: 100 tal cual, 50 la mitad, 0 baila en el sitio.",
+    ["mmd_vmd_npc.ui.movement_limit"] = "Límite de movimiento (unidades, 0 = sin límite)",
+    ["mmd_vmd_npc.ui.movement_limit_help"] = "Mantiene al personaje dentro de esta distancia del punto de inicio del baile, frenando suavemente cerca del borde en lugar de detenerse en seco como contra una pared. Un jugador mide unas 72 unidades. Estas opciones se aplican al empezar la reproducción.",
     ["mmd_vmd_npc.ui.column.motion"] = "Movimiento",
     ["mmd_vmd_npc.ui.column.duration"] = "Duración",
     ["mmd_vmd_npc.ui.column.addon"] = "Desde addon",

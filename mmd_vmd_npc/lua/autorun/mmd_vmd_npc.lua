@@ -56,6 +56,7 @@ if SERVER then
     util.AddNetworkString("mmdvmd_eye_track_camera")
     util.AddNetworkString("mmdvmd_camera_begin")
     util.AddNetworkString("mmdvmd_camera_keys")
+    util.AddNetworkString("mmdvmd_camera_shift")
     util.AddNetworkString("mmdvmd_camera_stop")
     util.AddNetworkString("mmdvmd_camera_sync")
     util.AddNetworkString("mmdvmd_camera_debug_request")
