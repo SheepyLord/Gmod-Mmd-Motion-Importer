@@ -52,6 +52,8 @@
   "inputs.export_addon.tooltip": "Empaqueta el JSON de movimiento importado y la música opcional en un archivo .gma distribuible.",
   "inputs.disable_foot_ik": "Desactivar IK de pies (movimiento sin IK)",
   "inputs.disable_foot_ik.tooltip": "Desactiva todas las restricciones IK del modelo (pies y dedos) antes del horneado. Úsalo para movimientos creados sin IK de pies: horneados con IK activado, las piernas quedan fijadas a la pose de reposo. Déjalo desactivado para movimientos normales.",
+  "inputs.unify_ground": "Unificar la altura del suelo (anular la colocación en el escenario)",
+  "inputs.unify_ground.tooltip": "Para movimientos que llevan al personaje entre plataformas o alturas del escenario, como las conversiones de Project Diva: mantiene sus pies al mismo nivel de suelo durante todo el baile (los saltos conservan su altura) y baja la cámara importada la misma cantidad en cada fotograma. Déjalo desactivado para movimientos normales.",
   "inputs.cancel_import": "Cancelar importación",
   "inputs.progress.title": "Progreso de horneado",
   "inputs.progress.idle": "No hay horneado en curso.",

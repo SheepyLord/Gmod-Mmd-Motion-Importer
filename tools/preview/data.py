@@ -12,9 +12,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from tools import import_vmd
+    from tools import import_vmd, vmd_baker
 except ModuleNotFoundError:  # running from tools/ as a bundled script
     import import_vmd  # type: ignore[no-redef]
+    import vmd_baker  # type: ignore[no-redef]
 
 
 ROOT_MOTION_NAMES = {
@@ -125,6 +126,10 @@ class PreviewScene:
     warnings: list[str] = field(default_factory=list)
     camera_vmd_path: Path | None = None
     camera_frames: list[import_vmd.CameraFrame] = field(default_factory=list)
+    motion: import_vmd.ParsedVMD | None = None
+    # Per-frame heights (MMD units, from frame 0) the import's "unify ground
+    # height" option removes; None when the option is off.
+    ground_offsets: object | None = None
 
 
 class PreviewPMXReader(import_vmd.PMXReader):
@@ -519,12 +524,34 @@ def sample_ik_enabled(property_frames: list[import_vmd.PropertyFrame], frame: fl
     return states
 
 
+def preview_ground_offsets(
+    model_path: Path,
+    motion: import_vmd.ParsedVMD,
+    disable_ik: bool = False,
+    warnings: list[str] | None = None,
+):
+    """The same per-frame ground offsets the import bakes with "unify ground
+    height", so the preview shows exactly what the import will produce."""
+    offsets = vmd_baker.compute_ground_offsets(
+        import_vmd.parse_pmx_bones(model_path),
+        motion,
+        0,
+        motion.max_frame,
+        disable_ik=disable_ik,
+    )
+    if offsets is None and warnings is not None:
+        warnings.append("Ground unification needs the standard leg bones; showing the original heights")
+    return offsets
+
+
 def load_preview_scene(
     model_path: Path,
     body_vmd_path: Path,
     flex_vmd_paths: list[Path] | None = None,
     music_path: Path | None = None,
     camera_vmd_path: Path | None = None,
+    unify_ground: bool = False,
+    disable_ik: bool = False,
 ) -> PreviewScene:
     if not model_path.exists():
         raise FileNotFoundError(model_path)
@@ -614,4 +641,6 @@ def load_preview_scene(
         warnings=warnings,
         camera_vmd_path=camera_vmd_path if camera_frames else None,
         camera_frames=camera_frames,
+        motion=motion,
+        ground_offsets=preview_ground_offsets(model_path, motion, disable_ik, warnings) if unify_ground else None,
     )

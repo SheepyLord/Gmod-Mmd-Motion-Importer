@@ -23,14 +23,25 @@ except Exception:  # pragma: no cover - widget reports unavailable backend
     GL = None
 
 try:
-    from tools import import_vmd
-    from tools.preview.data import PreviewScene, load_preview_scene, sample_bone_motion, sample_ik_enabled
+    from tools import import_vmd, vmd_baker
+    from tools.preview.data import PreviewScene, load_preview_scene, preview_ground_offsets, sample_bone_motion, sample_ik_enabled
 except ModuleNotFoundError:
     import import_vmd  # type: ignore[no-redef]
-    from preview.data import PreviewScene, load_preview_scene, sample_bone_motion, sample_ik_enabled  # type: ignore[no-redef]
+    import vmd_baker  # type: ignore[no-redef]
+    from preview.data import (  # type: ignore[no-redef]
+        PreviewScene,
+        load_preview_scene,
+        preview_ground_offsets,
+        sample_bone_motion,
+        sample_ik_enabled,
+    )
 
 
 DEFAULT_FRONT_VIEW_YAW = math.pi
+# The orbit view follows the character once it strays this far (a fraction of
+# the model size) from the view center, and re-centers on a jump bigger than
+# the model (stage placement teleports), so it never leaves the view.
+FOLLOW_DEAD_ZONE = 0.3
 PREVIEW_GMOD_MODEL_LABEL = r"models\sheepylord\arknight_endfield\li_zhiyan.mdl"
 
 
@@ -189,6 +200,7 @@ class PreviewWidget(QOpenGLWindow):
         self._children: list[list[int]] = []
         self._deform_mirror_pairs: list[tuple[int, int]] = []
         self._scene_center = np.zeros(3, dtype=np.float64)
+        self._view_center = np.zeros(3, dtype=np.float64)
         self._scene_mins = np.zeros(3, dtype=np.float64)
         self._scene_maxs = np.ones(3, dtype=np.float64)
         self._scene_extent = 1.0
@@ -233,8 +245,18 @@ class PreviewWidget(QOpenGLWindow):
         flex_vmd_paths: list[Path] | None = None,
         music_path: Path | None = None,
         camera_vmd_path: Path | None = None,
+        unify_ground: bool = False,
+        disable_ik: bool = False,
     ) -> PreviewScene:
-        self.scene_data = load_preview_scene(model_path, body_vmd_path, flex_vmd_paths, music_path, camera_vmd_path)
+        self.scene_data = load_preview_scene(
+            model_path,
+            body_vmd_path,
+            flex_vmd_paths,
+            music_path,
+            camera_vmd_path,
+            unify_ground=unify_ground,
+            disable_ik=disable_ik,
+        )
         self._prepare_scene_cache()
         self.reset_front_view()
         self.current_frame = float(self.scene_data.frame_start)
@@ -285,7 +307,39 @@ class PreviewWidget(QOpenGLWindow):
         self._view_pitch = 0.0
         self._view_zoom = 1.0
         self._view_pan = QtCore.QPointF(0.0, 0.0)
+        self._view_center = self._scene_center.copy()
         self.update()
+
+    def set_ground_unified(self, enabled: bool, disable_ik: bool = False) -> None:
+        """Toggle the import's "unify ground height" result on the loaded scene."""
+        scene = self.scene_data
+        if not scene or scene.motion is None:
+            return
+        scene.ground_offsets = (
+            preview_ground_offsets(scene.model_path, scene.motion, disable_ik, scene.warnings) if enabled else None
+        )
+        self._frame_cache.clear()
+        self.update()
+
+    def _ground_offset(self, frame: float) -> float:
+        scene = self.scene_data
+        if not scene or scene.ground_offsets is None:
+            return 0.0
+        return vmd_baker.ground_offset_at(scene.ground_offsets, 0, frame)
+
+    def _follow_character(self, skinned: np.ndarray | None, bone_world: np.ndarray | None) -> None:
+        points = skinned if skinned is not None and len(skinned) else bone_world
+        if points is None or not len(points):
+            return
+        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        delta = center - self._view_center
+        dead_zone = FOLLOW_DEAD_ZONE * self._scene_extent
+        if float(np.max(np.abs(delta))) > self._scene_extent:
+            self._view_center = center
+            return
+        excess = np.abs(delta) - dead_zone
+        moving = excess > 0
+        self._view_center = self._view_center + np.where(moving, np.sign(delta) * excess, 0.0)
 
     def play(self) -> None:
         if not self.scene_data:
@@ -833,6 +887,12 @@ class PreviewWidget(QOpenGLWindow):
         morphed_positions, active_morphs = self._morphed_positions(self.current_frame)
         skin_matrices, bone_world, active_ik, enabled_ik, ik_warning = self._pose_matrices()
         skinned = self._skinned_vertices(skin_matrices, morphed_positions)
+        ground = self._ground_offset(self.current_frame)
+        if ground:
+            if skinned is not None:
+                skinned[:, 1] -= ground
+            if bone_world is not None:
+                bone_world[:, 1] -= ground
         self._enabled_ik_count = enabled_ik
         self._first_ik_warning = ik_warning
         result = (skinned, bone_world, active_morphs, active_ik, enabled_ik, ik_warning)
@@ -850,6 +910,7 @@ class PreviewWidget(QOpenGLWindow):
     def paintGL(self) -> None:
         self._update_fps()
         skinned, bone_world, self._active_morph_count, self._active_ik_count = self._evaluate_frame()
+        self._follow_character(skinned, bone_world)
 
         if GL:
             try:
@@ -1057,6 +1118,9 @@ class PreviewWidget(QOpenGLWindow):
             return None
 
         target, rotation, distance, fov = import_vmd.sample_camera_frames(scene.camera_frames, self.current_frame)
+        ground = self._ground_offset(self.current_frame)
+        if ground:
+            target = (target[0], target[1] - ground, target[2])
         eye, forward, up = import_vmd.mmd_camera_pose(target, rotation, distance)
         eye = np.array(eye, dtype=np.float64)
         f = np.array(forward, dtype=np.float64)
@@ -1126,7 +1190,7 @@ class PreviewWidget(QOpenGLWindow):
         cp, sp = math.cos(self._view_pitch), math.sin(self._view_pitch)
         yaw = np.array([[cy, 0.0, sy, 0.0], [0.0, 1.0, 0.0, 0.0], [-sy, 0.0, cy, 0.0], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
         pitch = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, cp, -sp, 0.0], [0.0, sp, cp, 0.0], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
-        view = pitch @ yaw @ _translation_matrix(-self._scene_center)
+        view = pitch @ yaw @ _translation_matrix(-self._view_center)
         return proj, view
 
     def _project_np(self, positions: np.ndarray) -> tuple[list[QtCore.QPointF], np.ndarray]:
@@ -1192,7 +1256,7 @@ class PreviewWidget(QOpenGLWindow):
             painter.setFont(old_font)
 
     def _draw_center_marker(self, painter: QtGui.QPainter) -> None:
-        center = self._project_point(self._scene_center)
+        center = self._project_point(self._view_center)
         painter.setPen(QtGui.QPen(QtGui.QColor(255, 90, 90, 210), 1))
         painter.drawLine(QtCore.QPointF(center.x() - 8.0, center.y()), QtCore.QPointF(center.x() + 8.0, center.y()))
         painter.drawLine(QtCore.QPointF(center.x(), center.y() - 8.0), QtCore.QPointF(center.x(), center.y() + 8.0))

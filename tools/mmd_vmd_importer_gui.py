@@ -135,6 +135,7 @@ class ImportWorker(QtCore.QThread):
             motion_name = str(self.settings.get("motion_name") or "").strip()
             audio_offset = float(self.settings.get("audio_offset") or 0.0)
 
+            unify_ground = bool(self.settings.get("unify_ground"))
             try:
                 rotation_document = import_vmd.bake_vmd_native(
                     body_vmd,
@@ -142,6 +143,7 @@ class ImportWorker(QtCore.QThread):
                     progress=self._log,
                     cancel_check=self._cancelled,
                     disable_foot_ik=bool(self.settings.get("disable_foot_ik")),
+                    unify_ground=unify_ground,
                 )
             except RuntimeError:
                 if self.cancel_requested:
@@ -149,6 +151,11 @@ class ImportWorker(QtCore.QThread):
                 raise
             if self.cancel_requested:
                 raise RuntimeError(I18N.t("error.import_cancelled"))
+            ground_offsets = import_vmd.rotation_ground_offsets(rotation_document) if unify_ground else None
+            if camera_track is not None and ground_offsets:
+                # Lower the camera with the character every frame so it keeps
+                # framing the dancer after the stage heights are cancelled.
+                camera_track = import_vmd.build_camera_track(Path(camera_path_raw), self._log, ground_offsets=ground_offsets)
 
             music_metadata = None
             music_path_raw = str(self.settings.get("music_path") or "")
@@ -602,6 +609,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
             self.disable_foot_ik_check.setText(self.tr("inputs.disable_foot_ik"))
             self.disable_foot_ik_check.setToolTip(self.tr("inputs.disable_foot_ik.tooltip"))
+            self.unify_ground_check.setText(self.tr("inputs.unify_ground"))
+            self.unify_ground_check.setToolTip(self.tr("inputs.unify_ground.tooltip"))
             self.input_audio_offset_slider.setToolTip(self.tr("inputs.audio_offset.tooltip"))
             self.audio_offset_slider.setToolTip(self.tr("preview.audio_offset.tooltip"))
 
@@ -761,6 +770,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
         self.disable_foot_ik_check = QtWidgets.QCheckBox(self.tr("inputs.disable_foot_ik"))
         self.disable_foot_ik_check.setToolTip(self.tr("inputs.disable_foot_ik.tooltip"))
+        self.unify_ground_check = QtWidgets.QCheckBox(self.tr("inputs.unify_ground"))
+        self.unify_ground_check.setToolTip(self.tr("inputs.unify_ground.tooltip"))
         self.cancel_button = QtWidgets.QPushButton(self.tr("inputs.cancel_import"))
         self.cancel_button.setEnabled(False)
         self.detect_gmod_button.clicked.connect(self.detect_gmod)
@@ -770,10 +781,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         for button in (self.detect_gmod_button, self.preview_button, self.import_button):
             actions.addWidget(button)
         actions.addWidget(self.export_addon_check)
-        actions.addWidget(self.disable_foot_ik_check)
         actions.addWidget(self.cancel_button)
         actions.addStretch(1)
         layout.addLayout(actions)
+        bake_options = QtWidgets.QHBoxLayout()
+        bake_options.addWidget(self.disable_foot_ik_check)
+        bake_options.addWidget(self.unify_ground_check)
+        bake_options.addStretch(1)
+        layout.addLayout(bake_options)
 
         self.progress_group = QtWidgets.QGroupBox(self.tr("inputs.progress.title"))
         progress_layout = QtWidgets.QVBoxLayout(self.progress_group)
@@ -1027,6 +1042,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.export_addon_check.setChecked(bool(export_addon))
             disable_foot_ik = self.settings_store.value("disable_foot_ik", False, bool)
             self.disable_foot_ik_check.setChecked(bool(disable_foot_ik))
+            unify_ground = self.settings_store.value("unify_ground", False, bool)
+            self.unify_ground_check.setChecked(bool(unify_ground))
         finally:
             self._loading_settings = False
 
@@ -1040,6 +1057,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.motion_meta_table.itemChanged.connect(self._on_motion_meta_changed)
         self.export_addon_check.toggled.connect(lambda _value: self.save_persisted_settings())
         self.disable_foot_ik_check.toggled.connect(lambda _value: self.save_persisted_settings())
+        self.unify_ground_check.toggled.connect(lambda _value: self.save_persisted_settings())
+        self.unify_ground_check.toggled.connect(self.on_unify_ground_toggled)
+        # Foot IK changes where the feet land, so a unified preview re-measures the floor.
+        self.disable_foot_ik_check.toggled.connect(
+            lambda _value: self.on_unify_ground_toggled(True) if self.unify_ground_check.isChecked() else None
+        )
 
     def _retranslate_motion_meta_headers(self) -> None:
         for column, field in enumerate(import_vmd.MOTION_META_FIELDS):
@@ -1112,6 +1135,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.settings_store.setValue("flex_vmds", self.flex_vmd_paths())
         self.settings_store.setValue("export_addon", self.export_addon_check.isChecked())
         self.settings_store.setValue("disable_foot_ik", self.disable_foot_ik_check.isChecked())
+        self.settings_store.setValue("unify_ground", self.unify_ground_check.isChecked())
         self.settings_store.sync()
 
     def auto_detect_missing_paths(self) -> None:
@@ -1202,6 +1226,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 [Path(path) for path in self.flex_vmd_paths()],
                 Path(self.music_row.value()) if self.music_row.value() else None,
                 Path(self.camera_row.value()) if self.camera_row.value() else None,
+                unify_ground=self.unify_ground_check.isChecked(),
+                disable_ik=self.disable_foot_ik_check.isChecked(),
             )
             self.preview.set_follow_camera(self.follow_camera_check.isChecked())
             self.follow_camera_check.setEnabled(self.preview.has_camera_motion())
@@ -1229,6 +1255,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def update_preview_audio_offset(self, value: int) -> None:
         self.set_audio_offset_value(value)
+
+    def on_unify_ground_toggled(self, enabled: bool) -> None:
+        if self._loading_settings or not self.preview.scene_data:
+            return
+        try:
+            self.preview.set_ground_unified(bool(enabled), disable_ik=self.disable_foot_ik_check.isChecked())
+        except Exception as exc:
+            self.show_error(self.tr("dialog.preview_failed.title"), str(exc))
 
     def default_bake_estimate_seconds(self, frame_count: int) -> float:
         return DEFAULT_BAKE_STARTUP_SECONDS + max(0, int(frame_count)) * DEFAULT_BAKE_SECONDS_PER_FRAME
@@ -1452,6 +1486,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "export_addon": export_addon,
             "addon_gma_path": addon_gma_path,
             "disable_foot_ik": self.disable_foot_ik_check.isChecked(),
+            "unify_ground": self.unify_ground_check.isChecked(),
         }
         self.log.clear()
         self.load_preview()

@@ -2891,6 +2891,35 @@ local cv_root_motion_origin = CreateConVar(
     "Carry the dance's root travel on the entity origin so characters can walk any distance (0 = legacy bone-offset only)"
 )
 
+-- Clients learn that the pose jumps (a scene cut, the start, a loop, the stop)
+-- from a networked counter; cl_menu.lua turns it into hook MMDVMDNPCPoseCut for
+-- hair and cloth physics. See MMDVMDNPC.BuiltPoseCuts.
+local function bump_pose_cut(ent)
+    if not IsValid(ent) then return end
+    local name = MMDVMDNPC.PoseCutNW2
+    ent:SetNW2Int(name, (ent:GetNW2Int(name, 0) + 1) % 65536)
+end
+
+-- Raised one tick ahead, for every cut up to the frame the next tick shows, so
+-- the counter reaches a client with the jump or before it; told after the jump,
+-- the physics would already have dragged the hair across the stage.
+local function announce_pose_cuts(ent, state, cuts, frame, sourceFrame, endFrame, sourceFPS)
+    local interval = math.max(1 / clamp_playback_hz(state.playbackHz), engine.TickInterval())
+    local ahead = sourceFrame + interval * sourceFPS
+    local through = math.min(endFrame, math.floor(ahead))
+    local jump = state.cutThrough == nil or frame < state.cutFrame or (state.loopPlayback == true and ahead >= endFrame)
+    if not jump then
+        for f = math.max(frame, state.cutThrough) + 1, through do
+            if cuts[f] then
+                jump = true
+                break
+            end
+        end
+    end
+    state.cutFrame, state.cutThrough = frame, math.max(frame, through)
+    if jump then bump_pose_cut(ent) end
+end
+
 -- Reused engine objects for the per-tick pose writes (ManipulateBone* copies
 -- its argument), instead of a fresh Angle and Vector per bone per tick.
 local apply_built_sample
@@ -3071,6 +3100,7 @@ function MMDVMDNPC.StopPlayback(ent, clearPose)
         clear_all_bone_manipulations(ent)
         clear_all_flex_weights(ent)
         force_reference_pose(ent)
+        if state then bump_pose_cut(ent) end
     end
 
     if state and IsValid(state.ply) then
@@ -3721,6 +3751,16 @@ local function update_playback_state(ent, state, now)
     local fraction = sourceFrame - lowerFrame
     local lowerIndex = math.Clamp(lowerFrame - startFrame + 1, 1, #frames)
     local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
+
+    -- Hold the frame before a scene cut until the cut's own frame: blending
+    -- across it slides the dancer through the stage in one frame time.
+    local cuts = state.poseCuts
+    if not cuts then
+        cuts = MMDVMDNPC.BuiltPoseCuts(built, ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil)
+        state.poseCuts = cuts
+    end
+    if cuts[upperFrame] then fraction = 0 end
+    announce_pose_cuts(ent, state, cuts, lowerFrame, sourceFrame, endFrame, sourceFPS)
 
     if ent.SetCycle then ent:SetCycle(0) end
     if ent.SetPlaybackRate then ent:SetPlaybackRate(0) end

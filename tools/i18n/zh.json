@@ -69,6 +69,8 @@
   "inputs.export_addon.tooltip": "将导入的动作 JSON 和可选音乐打包为可分发的 .gma 文件。",
   "inputs.disable_foot_ik": "禁用足部 IK（无 IK 动作）",
   "inputs.disable_foot_ik.tooltip": "烘焙前关闭模型上的所有 IK 约束（脚部与脚尖）。用于未使用足部 IK 制作的动作——这类动作若开启 IK 烘焙，双腿会被固定在初始姿势。普通动作请保持关闭。",
+  "inputs.unify_ground": "统一地面高度（抵消舞台位置）",
+  "inputs.unify_ground.tooltip": "适用于把角色移到不同舞台平台或高度的动作（例如 Project Diva 转换动作）：整段舞蹈中让角色双脚保持在同一地面高度（跳跃高度保留），并把导入的镜头每帧下移相同高度。普通动作请保持关闭。",
   "inputs.cancel_import": "取消导入",
   "inputs.progress.title": "烘焙进度",
   "inputs.progress.idle": "没有正在进行的烘焙。",

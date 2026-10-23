@@ -6,8 +6,11 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import json
 import math
+import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -40,6 +43,21 @@ def key(frame: int, location=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0)) -> 
 
 def motion(bone_frames: dict, property_frames=None, max_frame: int = 0) -> import_vmd.ParsedVMD:
     return import_vmd.ParsedVMD("test", bone_frames, {}, list(property_frames or []), max_frame)
+
+
+def write_vmd(path: Path, camera_keys: list[tuple[int, float, tuple, tuple]] = ()) -> Path:
+    """Minimal VMD: no bones or morphs, optional camera keys
+    (frame, distance, target, rotation) with linear interpolation."""
+    out = bytearray(b"Vocaloid Motion Data 0002".ljust(30, b"\x00") + b"camera".ljust(20, b"\x00"))
+    out += struct.pack("<II", 0, 0)
+    out += struct.pack("<I", len(camera_keys))
+    for frame, distance, target, rotation in camera_keys:
+        out += struct.pack("<If3f3f", frame, distance, *target, *rotation)
+        out += bytes([20, 107, 20, 107] * 6)
+        out += struct.pack("<IB", 30, 0)
+    out += struct.pack("<III", 0, 0, 0)
+    path.write_bytes(bytes(out))
+    return path
 
 
 class BakerTestCase(unittest.TestCase):
@@ -226,6 +244,128 @@ class BakeTests(BakerTestCase):
         vmd = motion({"左腕": [key(0), key(5000)]}, max_frame=5000)
         with self.assertRaises(vmd_baker.BakeCancelled):
             self.bake(vmd, cancel_check=lambda: True)
+
+
+class GroundUnifyTests(BakerTestCase):
+    def test_floor_envelope_keeps_cuts_sharp_and_jumps_high(self) -> None:
+        lowest = np.zeros(300)
+        lowest[100:200] = 50.0  # scene cut onto a platform
+        lowest[140:151] += 6.0  # an 11-frame jump on the platform
+        lowest[200:230] = np.linspace(50.0, 80.0, 30)  # a riser
+        lowest[230:] = 80.0
+        offsets = vmd_baker.ground_offsets(lowest, rest_height=0.0)
+        np.testing.assert_allclose(offsets[:100], 0.0, atol=1e-9)
+        np.testing.assert_allclose(offsets[100:135], 50.0, atol=1e-9)  # cut stays a clean step
+        np.testing.assert_allclose(offsets[140:151], 50.0, atol=1e-9)  # the jump keeps its 6 units
+        np.testing.assert_allclose(offsets[212:218], lowest[212:218], atol=0.05)  # riser followed
+        np.testing.assert_allclose(offsets[240:], 80.0, atol=1e-9)
+
+    def test_rest_floor_is_the_lowest_contact_bone(self) -> None:
+        contacts = vmd_baker.ground_contact_bones(self.model)
+        self.assertIn(self.index["左つま先"], contacts)
+        pose = self.pose(motion({}, max_frame=0), [0])
+        lowest = vmd_baker.lowest_contact_heights(pose, contacts)
+        self.assertAlmostEqual(float(lowest[0]), vmd_baker.ground_rest_height(self.model, contacts), places=3)
+
+    def test_unify_ground_cancels_a_stage_platform(self) -> None:
+        # 全ての親 lifts the whole character onto a 40-unit platform at a cut.
+        stage = motion(
+            {"全ての親": [key(0), key(20), key(21, location=(0.0, 40.0, 0.0)), key(60, location=(0.0, 40.0, 0.0))]},
+            max_frame=60,
+        )
+        scale = vmd_baker.MMD_TO_BLENDER_SCALE * vmd_baker.BLENDER_TO_SOURCE_POSITION_SCALE
+        plain = self.track(self.bake(stage), "ValveBiped.Bip01_Pelvis")
+        self.assertAlmostEqual(self.sample(plain, 40)[5] - self.sample(plain, 10)[5], 40.0 * scale, places=3)
+
+        document = self.bake(stage, unify_ground=True)
+        pelvis = self.track(document, "ValveBiped.Bip01_Pelvis")
+        self.assertAlmostEqual(self.sample(pelvis, 40)[5], self.sample(pelvis, 10)[5], places=3)
+        # Standing frames stay where they were (within the rest pose's 0.5 deg knee-bend lift).
+        self.assertAlmostEqual(self.sample(pelvis, 10)[5], self.sample(plain, 10)[5], delta=0.01)
+        offsets = document["_ground_offsets_mmd"]
+        self.assertEqual(len(offsets), 61)
+        self.assertAlmostEqual(offsets[40] - offsets[10], 40.0, places=3)
+        self.assertTrue(document["ground_unified"])
+        self.assertNotIn("_ground_offsets_mmd", self.bake(stage))
+
+    def test_camera_is_lowered_with_the_character(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            camera = write_vmd(Path(tmp) / "camera.vmd", [(0, -45.0, (0.0, 10.0, 0.0), (0.0, 0.0, 0.0)), (60, -45.0, (0.0, 10.0, 0.0), (0.0, 0.0, 0.0))])
+            offsets = [0.0] * 21 + [40.0] * 40
+            plain = import_vmd.build_camera_track(camera)
+            lowered = import_vmd.build_camera_track(camera, ground_offsets=offsets)
+
+        def height(track: dict, frame: int) -> float:
+            keys = track["keys"]
+            return float(np.interp(frame, [k[0] for k in keys], [k[3] for k in keys]))
+
+        self.assertNotIn("ground_unified", plain)
+        self.assertTrue(lowered["ground_unified"])
+        self.assertAlmostEqual(height(lowered, 10), height(plain, 10), places=3)
+        self.assertAlmostEqual(height(plain, 40) - height(lowered, 40), 40.0 * import_vmd.CAMERA_POSITION_SCALE, places=2)
+        self.assertAlmostEqual(height(plain, 60) - height(lowered, 60), 40.0 * import_vmd.CAMERA_POSITION_SCALE, places=2)
+
+    def test_motion_json_omits_bake_working_data(self) -> None:
+        stage = motion({"全ての親": [key(0), key(10, location=(0.0, 5.0, 0.0))]}, max_frame=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            body = write_vmd(Path(tmp) / "body.vmd")
+            document = vmd_baker.bake_motion(
+                self.bones, stage, self.bone_map, 0, 10, model_path=self.model_path, input_vmd=body, unify_ground=True
+            )
+            self.assertIn("_ground_offsets_mmd", document)
+            output = import_vmd.write_motion_json(document, Path(tmp) / "out", "stage test", body)
+            written = json.loads(output.read_text(encoding="utf-8"))
+        self.assertFalse(any(key.startswith("_") for key in written))
+        self.assertTrue(written["ground_unified"])
+
+    def test_floor_smoothing_never_spans_a_scene_cut(self) -> None:
+        lowest = np.zeros(100)
+        lowest[50:] = 1.5  # a platform change smaller than GROUND_CUT_STEP, at a cut
+        smoothed = vmd_baker.ground_offsets(lowest, rest_height=0.0)
+        sharp = vmd_baker.ground_offsets(lowest, rest_height=0.0, pose_cuts=[50])
+        self.assertGreater(float(smoothed[49]), 1e-3)  # leaks into the shot before the cut
+        np.testing.assert_allclose(sharp[:50], 0.0, atol=1e-12)
+        np.testing.assert_allclose(sharp[50:], 1.5, atol=1e-12)
+
+
+class SceneCutTests(BakerTestCase):
+    def test_single_frame_jumps_are_cuts_and_motion_is_not(self) -> None:
+        run = np.zeros((60, 3))
+        run[:, 0] = np.arange(60) * 5.0  # running at 5 units a frame
+        self.assertEqual(vmd_baker.detect_pose_cuts(run), [])
+        jump = run.copy()
+        jump[30:, 0] += 40.0
+        self.assertEqual(vmd_baker.detect_pose_cuts(jump), [30])
+        small = np.zeros((40, 3))
+        small[20:, 0] = 7.0  # below CUT_MIN_STEP
+        self.assertEqual(vmd_baker.detect_pose_cuts(small), [])
+        # An accelerating dash is fast but continuous.
+        dash = np.zeros((40, 3))
+        dash[:, 0] = np.cumsum(np.r_[np.zeros(15), np.linspace(10, 60, 10), np.linspace(60, 10, 10), np.zeros(5)])
+        self.assertEqual(vmd_baker.detect_pose_cuts(dash), [])
+        # Out to another spot and back two frames later: neither cut hides the other.
+        out_and_back = np.zeros((40, 3))
+        out_and_back[20:22, 2] = 100.0
+        self.assertEqual(vmd_baker.detect_pose_cuts(out_and_back), [20, 22])
+
+    def test_bake_records_scene_cuts_in_the_motion_json(self) -> None:
+        # 全ての親 moves the character 30 MMD units (about 100 Source units) in one frame.
+        stage = motion(
+            {"全ての親": [key(0), key(20), key(21, location=(30.0, 0.0, 0.0)), key(40, location=(30.0, 0.0, 0.0))]},
+            max_frame=40,
+        )
+        document = self.bake(stage)
+        self.assertEqual(document["cuts"], [21])
+        walk = motion({"センター": [key(0), key(40, location=(0.0, 0.0, 30.0))]}, max_frame=40)
+        self.assertEqual(self.bake(walk)["cuts"], [])
+        # A rotation document without the field (Blender, older bakes) gets it from the pelvis track.
+        legacy = {name: value for name, value in document.items() if name != "cuts"}
+        self.assertEqual(vmd_baker.document_pose_cuts(legacy), [21])
+        with tempfile.TemporaryDirectory() as tmp:
+            body = write_vmd(Path(tmp) / "body.vmd")
+            output = import_vmd.write_motion_json(legacy, Path(tmp) / "out", "cut test", body)
+            written = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(written["cuts"], [21])
 
 
 if __name__ == "__main__":

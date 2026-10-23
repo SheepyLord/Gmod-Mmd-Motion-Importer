@@ -44,6 +44,40 @@ CHUNK_FRAMES = 2048
 # Guard against corrupt PMX loop counts; real models use 15-100.
 MAX_IK_LOOPS = 256
 
+# Ground unification (stage placement cancelling). Bones that can rest on the
+# floor: the lowest of them each frame is the character's ground contact -
+# the feet normally, knees/hands/hips during floor work.
+GROUND_CONTACT_BONES = (
+    "左つま先", "右つま先", "左足先EX", "右足先EX", "左足首", "右足首",
+    "左ひざ", "右ひざ", "左手首", "右手首", "左ひじ", "右ひじ",
+    "下半身", "上半身", "上半身2", "首", "頭",
+)
+# Half-window of the ground envelope: airborne phases up to ~1 s (31 frames)
+# keep their height above the floor; anything longer counts as standing on
+# a raised surface.
+GROUND_AIRBORNE_FRAMES = 15
+# Ground changes faster than this (MMD units per frame) are stage cuts or
+# drops and stay sharp; slower ones are smoothed over GROUND_SMOOTH_SIGMA
+# frames so support-foot switches do not pop.
+GROUND_CUT_STEP = 2.0
+GROUND_SMOOTH_SIGMA = 2.0
+
+# Scene cuts: frames where the character's placement jumps within one frame,
+# as Project Diva and other PV motions move the performer between stage spots
+# at their camera cuts. A pelvis step above CUT_MIN_STEP Source units and
+# CUT_RATIO times the median step of the CUT_NEIGHBOURS frames on either side
+# is a cut: dancing stays below about 10 units a frame, faster moves (the
+# dashes of action PVs) build up over several frames, which the median leaves
+# alone, and the Project Diva cuts measured are 8 to 1,000. The GMod addon
+# holds the frame before a cut instead of blending across it and marks the
+# jump for hair and cloth physics; it applies the same rule to its built
+# frames (MMDVMDNPC.BuiltPoseCuts in sh_core.lua), so change both together.
+CUT_MIN_STEP = 8.0
+CUT_RATIO = 4.0
+CUT_NEIGHBOURS = 3
+# Bones whose world position is the character's placement; the first present wins.
+PLACEMENT_BONES = ("下半身", "センター")
+
 PRE_PELVIS_ROLES = {"root", "center", "groove", "waist"}
 SOURCE_PELVIS = "ValveBiped.Bip01_Pelvis"
 SOURCE_SPINE = "ValveBiped.Bip01_Spine"
@@ -969,6 +1003,181 @@ def evaluate_frames(
 
 
 # --------------------------------------------------------------------------
+# Ground unification: cancel stage placement heights (platforms, risers,
+# drops between scenes) so the character dances on one floor level.
+# --------------------------------------------------------------------------
+def ground_contact_bones(model: BakeModel) -> list[int]:
+    index = {name: bone for bone, name in enumerate(model.names)}
+    return [index[name] for name in GROUND_CONTACT_BONES if name in index]
+
+
+def ground_rest_height(model: BakeModel, contacts: list[int]) -> float:
+    """Height of the lowest contact bone in the rest pose: where the floor is."""
+    return float(model.rest_position[contacts, 1].min())
+
+
+def lowest_contact_heights(pose: _Pose, contacts: list[int]) -> np.ndarray:
+    return pose.global_p[contacts][:, :, 1].min(axis=0)
+
+
+def _sliding_reduce(values: np.ndarray, half: int, reducer: Callable) -> np.ndarray:
+    padded = np.pad(values, half, mode="edge")
+    return reducer(np.lib.stride_tricks.sliding_window_view(padded, 2 * half + 1), axis=1)
+
+
+def _gaussian_smooth(values: np.ndarray, sigma: float) -> np.ndarray:
+    radius = int(math.ceil(3.0 * sigma))
+    if sigma <= 0 or radius < 1 or len(values) < 2:
+        return values.copy()
+    taps = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (taps / sigma) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(values, radius, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def ground_offsets(
+    lowest: np.ndarray,
+    rest_height: float,
+    airborne_frames: int = GROUND_AIRBORNE_FRAMES,
+    cut_step: float = GROUND_CUT_STEP,
+    smooth_sigma: float = GROUND_SMOOTH_SIGMA,
+    pose_cuts=(),
+) -> np.ndarray:
+    """Per-frame height (MMD units) to subtract from the whole character so its
+    ground contact stays on the rest-pose floor.
+
+    The floor under the character is the morphological opening of the lowest
+    contact height: it ignores upward spikes shorter than 2*airborne_frames+1
+    frames (jumps keep their height) but follows steps and slopes exactly
+    (scene-cut platform changes, risers, drops). Changes slower than cut_step
+    per frame are smoothed so support switches between the feet do not pop;
+    the smoothing never spans a scene cut (pose_cuts, indices into lowest),
+    where a smaller platform change would otherwise leak into the shots
+    around it.
+    """
+    lowest = np.asarray(lowest, dtype=np.float64)
+    if lowest.size == 0:
+        return np.zeros(0)
+    half = max(0, int(airborne_frames))
+    floor = _sliding_reduce(_sliding_reduce(lowest, half, np.min), half, np.max) if half else lowest.copy()
+    cuts = np.flatnonzero(np.abs(np.diff(floor)) > cut_step) + 1
+    if len(pose_cuts):
+        cuts = np.union1d(cuts, np.asarray(pose_cuts, dtype=np.int64))
+    smoothed = np.empty_like(floor)
+    for run in np.split(np.arange(len(floor)), cuts):
+        smoothed[run] = _gaussian_smooth(floor[run], smooth_sigma)
+    return smoothed - rest_height
+
+
+def compute_ground_offsets(
+    bones: list,
+    vmd,
+    frame_start: int,
+    frame_end: int,
+    *,
+    disable_ik: bool = False,
+    nlerp: bool = False,
+    analytic_legs: bool = True,
+) -> np.ndarray | None:
+    """ground_offsets for frames frame_start..frame_end of `vmd` on `bones`,
+    evaluated exactly as bake_motion does; None when the model has none of the
+    standard contact bones."""
+    model = prepare_model(bones)
+    contacts = ground_contact_bones(model)
+    if not contacts:
+        return None
+    tracks, _ = build_tracks(model, vmd.bone_frames)
+    all_frames = np.arange(frame_start, frame_end + 1, dtype=np.float64)
+    masks = ik_enabled_masks(model, vmd.property_frames, all_frames, disable_all=disable_ik)
+    placement = placement_bone(model)
+    lowest, placements = [], []
+    for start in range(0, len(all_frames), CHUNK_FRAMES):
+        stop = min(len(all_frames), start + CHUNK_FRAMES)
+        pose = evaluate_frames(
+            model,
+            tracks,
+            all_frames[start:stop],
+            {ik: mask[start:stop] for ik, mask in masks.items()},
+            nlerp=nlerp,
+            analytic_legs=analytic_legs,
+        )
+        lowest.append(lowest_contact_heights(pose, contacts))
+        placements.append(pose.global_p[placement])
+    return ground_offsets(np.concatenate(lowest), ground_rest_height(model, contacts), pose_cuts=placement_cuts(placements))
+
+
+def ground_offset_at(offsets, frame_start: int, frame: float) -> float:
+    """Linearly interpolated offset at a (fractional) frame, held past the ends."""
+    if offsets is None or len(offsets) == 0:
+        return 0.0
+    position = min(max(float(frame) - frame_start, 0.0), float(len(offsets) - 1))
+    low = int(math.floor(position))
+    high = min(low + 1, len(offsets) - 1)
+    fraction = position - low
+    return float(offsets[low] + (offsets[high] - offsets[low]) * fraction)
+
+
+# --------------------------------------------------------------------------
+# Scene cuts: one-frame jumps of the character's placement (see CUT_MIN_STEP).
+# --------------------------------------------------------------------------
+def detect_pose_cuts(
+    positions,
+    min_step: float = CUT_MIN_STEP,
+    ratio: float = CUT_RATIO,
+    neighbours: int = CUT_NEIGHBOURS,
+) -> list[int]:
+    """Row indices i where positions[i] (one row per frame, Source units)
+    jumps from positions[i - 1]."""
+    positions = np.asarray(positions, dtype=np.float64)
+    if positions.ndim != 2 or len(positions) < 2:
+        return []
+    step = np.zeros(len(positions))
+    step[1:] = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    window = np.lib.stride_tricks.sliding_window_view
+    before = window(np.pad(step, (neighbours, 0)), neighbours)[:-1]
+    after = window(np.pad(step, (0, neighbours)), neighbours)[1:]
+    # The median, not the largest: two cuts a few frames apart (out and back,
+    # or a cut drawn over two frames) must not hide each other.
+    typical = np.median(np.concatenate((before, after), axis=1), axis=1)
+    jumps = (step > min_step) & (step > ratio * typical)
+    return [int(i) for i in np.flatnonzero(jumps)]
+
+
+def placement_bone(model: BakeModel) -> int:
+    index = {name: bone for bone, name in enumerate(model.names)}
+    return next((index[name] for name in PLACEMENT_BONES if name in index), 0)
+
+
+def placement_cuts(chunks: list[np.ndarray]) -> list[int]:
+    """Scene cuts (frame indices) in the placement bone's world positions,
+    given per bake chunk in MMD units."""
+    if not chunks:
+        return []
+    return detect_pose_cuts(np.concatenate(chunks) * (MMD_TO_BLENDER_SCALE * BLENDER_TO_SOURCE_POSITION_SCALE))
+
+
+def document_pose_cuts(document: dict) -> list[int]:
+    """Scene cut frames of a parent-corrected rotation document, read from its
+    pelvis track: for documents baked through Blender or before cuts were
+    recorded."""
+    pelvis = next(
+        (track for track in document.get("bones") or [] if track.get("role") == "pelvis_global" or track.get("g") == SOURCE_PELVIS),
+        None,
+    )
+    keys = pelvis.get("k") if pelvis else None
+    if not keys:
+        return []
+    start = int(document.get("frame_start", keys[0][0]))
+    end = int(document.get("frame_end", keys[-1][0]))
+    frames = np.arange(start, end + 1, dtype=np.float64)
+    key_frames = [float(k[0]) for k in keys]
+    # Compaction keeps the last frame of every hold, so linear interpolation restores each baked frame.
+    positions = np.stack([np.interp(frames, key_frames, [float(k[column]) for k in keys]) for column in (4, 5, 6)], axis=-1)
+    return [start + i for i in detect_pose_cuts(positions)]
+
+
+# --------------------------------------------------------------------------
 # Parent-corrected export (mirrors the old Blender-side exporter).
 # --------------------------------------------------------------------------
 def strip_blender_collision_suffix(name: str) -> str:
@@ -1081,6 +1290,31 @@ def _track_samples(model: BakeModel, pose: _Pose, plan: _OutputTrack) -> np.ndar
     return np.concatenate((rotation, position), axis=1)
 
 
+def _lower_pelvis_tracks(plans: list[_OutputTrack], offsets_mmd: np.ndarray) -> None:
+    """Move the whole character down by offsets_mmd (per frame, MMD units).
+    Only the pelvis track carries a world position - every other track is
+    parent-relative - so shifting its vertical column moves the full body."""
+    scale = MMD_TO_BLENDER_SCALE * BLENDER_TO_SOURCE_POSITION_SCALE
+    for plan in plans:
+        if plan.mode != "pelvis" or not plan.samples:
+            continue
+        samples = np.concatenate(plan.samples, axis=0)
+        # Pelvis position columns are (MMD z, MMD x, MMD y) * scale; see _source_position.
+        height = samples[:, 5] - offsets_mmd[: len(samples)] * scale
+        height = np.where(np.abs(height) < POSITION_EPSILON_SOURCE_UNITS, 0.0, np.round(height, 6))
+        samples[:, 5] = np.where(np.abs(height) < POSITION_EPSILON_SOURCE_UNITS, 0.0, height)
+        plan.samples = [samples]
+
+
+def _pelvis_cut_frames(plans: list[_OutputTrack], frame_start: int) -> list[int]:
+    """Scene cuts of the exported pelvis track, as VMD frames: after ground
+    unification, which can remove a cut or shrink it."""
+    for plan in plans:
+        if plan.mode == "pelvis" and plan.samples:
+            return [frame_start + i for i in detect_pose_cuts(np.concatenate(plan.samples, axis=0)[:, 3:6])]
+    return []
+
+
 def _values_equal(a: tuple, b: tuple) -> bool:
     for index in range(len(a)):
         epsilon = ROTATION_EPSILON_DEGREES if index < 3 else POSITION_EPSILON_SOURCE_UNITS
@@ -1130,11 +1364,17 @@ def bake_motion(
     disable_ik: bool = False,
     nlerp: bool = False,
     analytic_legs: bool = True,
+    unify_ground: bool = False,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> dict:
     """Bake `vmd` (import_vmd.ParsedVMD) on `bones` (import_vmd.PMXBone list)
-    and return the parent-corrected rotation document."""
+    and return the parent-corrected rotation document.
+
+    unify_ground keeps the character's ground contact on one floor level
+    (see ground_offsets). The per-frame offsets that were removed are returned
+    in the document's private "_ground_offsets_mmd" list so an imported camera
+    can be shifted by the same amount; write_motion_json drops that key."""
 
     def emit(message: str) -> None:
         if progress:
@@ -1157,6 +1397,12 @@ def bake_motion(
     masks = ik_enabled_masks(model, vmd.property_frames, all_frames, disable_all=disable_ik)
     if disable_ik:
         emit("Foot IK disabled for this bake (motion authored without IK).")
+    contacts = ground_contact_bones(model) if unify_ground else []
+    if unify_ground and not contacts:
+        emit("Warning: ground unification skipped: the model has none of the standard foot/leg bones.")
+    placement = placement_bone(model)
+    lowest_chunks: list[np.ndarray] = []
+    placement_chunks: list[np.ndarray] = []
 
     total = len(all_frames)
     emit(f"Baking pose frames {frame_start}..{frame_end} ({total} frames).")
@@ -1175,7 +1421,24 @@ def bake_motion(
         )
         for plan in plans:
             plan.samples.append(_track_samples(model, pose, plan))
+        if contacts:
+            lowest_chunks.append(lowest_contact_heights(pose, contacts))
+        placement_chunks.append(pose.global_p[placement])
         emit(f"Baked frames {frame_start + start}..{frame_start + stop - 1} of {frame_end}")
+
+    ground = None
+    if contacts:
+        ground = ground_offsets(np.concatenate(lowest_chunks), ground_rest_height(model, contacts), pose_cuts=placement_cuts(placement_chunks))
+        _lower_pelvis_tracks(plans, ground)
+        lifted = float(np.abs(ground).max()) if len(ground) else 0.0
+        emit(
+            f"Unified ground height: shifted the character by up to {lifted:.2f} MMD units "
+            f"({lifted * MMD_TO_BLENDER_SCALE:.2f} m) to keep it on one floor level."
+        )
+    cut_frames = _pelvis_cut_frames(plans, frame_start)
+    if cut_frames:
+        preview = ", ".join(str(frame) for frame in cut_frames[:12]) + (" ..." if len(cut_frames) > 12 else "")
+        emit(f"Scene cuts (the character jumps to another spot in one frame): {len(cut_frames)} at frame(s) {preview}")
 
     emit("Exporting parent-corrected bone rotations.")
     frame_list = [int(frame) for frame in all_frames.tolist()]
@@ -1223,6 +1486,7 @@ def bake_motion(
         "frame_end": int(frame_end),
         "frame_count": int(frame_end - frame_start + 1),
         "fps": VMD_FPS,
+        "cuts": cut_frames,
         "source_bone_map_count": len(bone_map),
         "mapped_track_count": len(plans),
         "identity_track_count": identity_tracks,
@@ -1231,5 +1495,9 @@ def bake_motion(
         "bones": bones_out,
         "baker": "native",
     }
+    if ground is not None:
+        document["ground_unified"] = True
+        document["ground_offset_range_mmd"] = [round(float(ground.min()), 4), round(float(ground.max()), 4)]
+        document["_ground_offsets_mmd"] = [round(float(value), 5) for value in ground]
     emit(f"Exported parent-corrected bone rotations: {len(bones_out)} bone track(s).")
     return document

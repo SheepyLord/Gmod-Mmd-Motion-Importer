@@ -43,6 +43,69 @@ MMDVMDNPC.ReferenceFArmAngleThreshold = 20
 MMDVMDNPC.ReferenceProbeRightUpperArm = "ValveBiped.Bip01_R_UpperArm"
 MMDVMDNPC.ReferenceProbeRightForearm = "ValveBiped.Bip01_R_Forearm"
 
+-- Scene cuts: frames where the dancer jumps to another spot within one frame,
+-- as Project Diva and other PV motions move the performer between stage spots
+-- at their camera cuts. Playback holds the frame before a cut instead of
+-- blending across it (a blend slides the dancer across the stage in 1/30 s),
+-- and announces the jump through the networked counter PoseCutNW2 and the
+-- client hook MMDVMDNPCPoseCut(ent, seconds), so hair and cloth physics such
+-- as Model Hotloader's carry their state across instead of being dragged.
+-- The rule is the importer's (tools/vmd_baker.py detect_pose_cuts), applied to
+-- the built frames so motions imported before it get their cuts too: a pelvis
+-- step above CutMinStep Source units and CutRatio times the median step of the
+-- CutNeighbours frames on either side. Change both together.
+MMDVMDNPC.CutMinStep = 8
+MMDVMDNPC.CutRatio = 4
+MMDVMDNPC.CutNeighbours = 3
+MMDVMDNPC.PoseCutNW2 = "MMDVMDNPCPoseCut"
+
+local poseCutCache = setmetatable({}, { __mode = "k" })
+
+-- Set of the absolute frames that start after a cut, for a built animation
+-- whose pelvis is pelvisBone; cached per built table.
+function MMDVMDNPC.BuiltPoseCuts(built, pelvisBone)
+    if not istable(built) or not isnumber(pelvisBone) or pelvisBone < 0 then return {} end
+    local cached = poseCutCache[built]
+    if cached and cached.bone == pelvisBone then return cached.cuts end
+
+    local steps, slot, px, py, pz = {}, nil, nil, nil, nil
+    for index, frame in ipairs(built.frames or {}) do
+        local bones = istable(frame) and frame.bones or {}
+        local entry = slot and bones[slot] or nil
+        if not entry or tonumber(entry[1]) ~= pelvisBone then
+            entry = nil
+            for k, candidate in ipairs(bones) do
+                if tonumber(candidate[1]) == pelvisBone then
+                    slot, entry = k, candidate
+                    break
+                end
+            end
+        end
+        local x = tonumber(entry and entry[5]) or 0
+        local y = tonumber(entry and entry[6]) or 0
+        local z = tonumber(entry and entry[7]) or 0
+        steps[index] = px and math.sqrt((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2) or 0
+        px, py, pz = x, y, z
+    end
+
+    local cuts, first, span, around = {}, math.floor(tonumber(built.frame_start) or 0), MMDVMDNPC.CutNeighbours, {}
+    for index = 2, #steps do
+        local step = steps[index]
+        if step > MMDVMDNPC.CutMinStep then
+            -- Frames past either end count as still, as in the importer.
+            for k = 1, span do
+                around[k] = steps[index - k] or 0
+                around[span + k] = steps[index + k] or 0
+            end
+            table.sort(around)
+            local median = (around[span] + around[span + 1]) * 0.5
+            if step > MMDVMDNPC.CutRatio * median then cuts[first + index - 1] = true end
+        end
+    end
+    poseCutCache[built] = { bone = pelvisBone, cuts = cuts }
+    return cuts
+end
+
 MMDVMDNPC.ForwardReferenceSequenceNames = {
     "Referencef",
     "referencef",

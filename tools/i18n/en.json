@@ -69,6 +69,8 @@
   "inputs.export_addon.tooltip": "Package the imported motion JSON and optional music into a distributable .gma file.",
   "inputs.disable_foot_ik": "Disable foot IK (motion baked without IK)",
   "inputs.disable_foot_ik.tooltip": "Turn off every IK constraint on the model (feet and toes) before baking. Use for motions authored without foot IK — baking those with IK enabled pins the legs to the rest pose. Leave off for normal motions.",
+  "inputs.unify_ground": "Unify ground height (cancel stage placement)",
+  "inputs.unify_ground.tooltip": "For motions that move the character between stage platforms or heights, such as Project Diva conversions: keeps her feet on one floor level for the whole dance (jumps keep their height) and lowers an imported camera by the same amount every frame. Leave off for normal motions.",
   "inputs.cancel_import": "Cancel Import",
   "inputs.progress.title": "Bake Progress",
   "inputs.progress.idle": "No bake running.",

@@ -69,6 +69,8 @@
   "inputs.export_addon.tooltip": "インポート済みモーション JSON と任意の音楽を配布可能な .gma にパッケージします。",
   "inputs.disable_foot_ik": "足IKを無効化（IKなしモーション用）",
   "inputs.disable_foot_ik.tooltip": "ベイク前にモデルの全IK制約（足・つま先）をオフにします。足IKを使わずに作られたモーション用です——IK有効のままベイクすると脚が初期ポーズに固定されます。通常のモーションではオフのままにしてください。",
+  "inputs.unify_ground": "地面の高さを統一（ステージ配置を打ち消す）",
+  "inputs.unify_ground.tooltip": "キャラクターをステージ上の台や別の高さへ移動させるモーション（Project Diva の変換モーションなど）向け：ダンス全体で足を同じ床の高さに保ち（ジャンプの高さは維持）、読み込んだカメラも毎フレーム同じ量だけ下げます。通常のモーションではオフのままにしてください。",
   "inputs.cancel_import": "インポートをキャンセル",
   "inputs.progress.title": "ベイク進行状況",
   "inputs.progress.idle": "ベイクは実行されていません。",

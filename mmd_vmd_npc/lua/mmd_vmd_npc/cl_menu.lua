@@ -1794,6 +1794,27 @@ local function deactivate_self_proxy_camera()
     MMDVMDNPC.SelfCameraHeightOffset = 0
 end
 
+-- How long hair and cloth physics carries a pose jump (hook MMDVMDNPCPoseCut,
+-- see MMDVMDNPC.BuiltPoseCuts): the bones jump when they arrive, or at once
+-- from this client's own poser, but the entity origin that root motion moves
+-- is drawn one interpolation interval later, then glides for an update.
+local function pose_cut_window()
+    local function setting(name, fallback)
+        local cvar = GetConVar(name)
+        return cvar and cvar:GetFloat() or fallback
+    end
+    local rate = math.max(1, setting("cl_updaterate", 30))
+    local interp = math.max(setting("cl_interp", 0.1), setting("cl_interp_ratio", 2) / rate)
+    return math.Clamp(interp + 2 / rate + 0.05, 0.1, 0.5)
+end
+
+-- The server raises a networked counter just before a dance's pose jumps.
+hook.Add("EntityNetworkedVarChanged", "MMDVMDNPCPoseCut", function(ent, name)
+    if name == MMDVMDNPC.PoseCutNW2 and IsValid(ent) then
+        hook.Run("MMDVMDNPCPoseCut", ent, pose_cut_window())
+    end
+end)
+
 local function stop_one_local_playback(ent, clearPose)
     local playbacks = MMDVMDNPC.LocalPlaybacks or {}
     local state = playbacks[ent]
@@ -1804,6 +1825,7 @@ local function stop_one_local_playback(ent, clearPose)
         deactivate_self_proxy_camera()
     end
     if clearPose ~= false then
+        if IsValid(state.ent) then hook.Run("MMDVMDNPCPoseCut", state.ent, pose_cut_window()) end
         clear_local_playback_pose(state.ent, state.built)
     end
 end
@@ -1890,6 +1912,26 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local fraction = sourceFrame - lowerFrame
             local lowerIndex = math.Clamp(lowerFrame - startFrame + 1, 1, #frames)
             local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
+
+            -- Hold across scene cuts like the server, and tell physics addons
+            -- on the frame this client's own pose jumps (a cut, the start, a loop).
+            local cuts = state.poseCuts
+            if not cuts then
+                cuts = MMDVMDNPC.BuiltPoseCuts(built, ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil)
+                state.poseCuts = cuts
+            end
+            if cuts[upperFrame] then fraction = 0 end
+            local jump = state.cutFrame == nil or lowerFrame < state.cutFrame
+            if not jump then
+                for frame = state.cutFrame + 1, lowerFrame do
+                    if cuts[frame] then
+                        jump = true
+                        break
+                    end
+                end
+            end
+            state.cutFrame = lowerFrame
+            if jump then hook.Run("MMDVMDNPCPoseCut", ent, pose_cut_window()) end
 
             apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, state.pelvisZOffset or 0)
             state.poseA, state.poseB, state.poseFraction = frames[lowerIndex], frames[upperIndex], fraction

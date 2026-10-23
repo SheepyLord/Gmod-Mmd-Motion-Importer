@@ -111,6 +111,15 @@ The build script bundles:
 4. Preview the motion and adjust audio offset if needed.
 5. Click the bake/import button.
 
+Bake options:
+
+- **Disable foot IK** — for motions authored without foot IK.
+- **Unify ground height (cancel stage placement)** — for motions that move the character between stage platforms or heights, such as Project Diva PV conversions. The character's feet stay on one floor level for the whole dance (jumps keep their height), and an imported camera is lowered by the same amount every frame so it keeps framing her. The preview shows the result. Leave it off for normal motions.
+
+The preview view follows the character, so motions that travel or carry stage placement stay in view.
+
+Scene cuts need no option. When a motion moves the character to another spot in a single frame (Project Diva PV conversions do this at most camera cuts), the addon plays the jump as a cut. It holds the pose before the cut until the cut's frame instead of sliding the dancer across the stage. It also announces the jump to hair and cloth physics, which Model Hotloader then carries across the cut instead of dragging the hair after the body. The bake log lists the cuts it found. The addon finds the same frames in the built animation, so motions imported before this change get the fix too.
+
 The importer writes motion JSON to:
 
 ```text
@@ -168,6 +177,15 @@ python tools/import_vmd.py "motions\dance.vmd" `
   --export-addon-gma "dist\MyDance.gma"
 ```
 
+Cancel stage placement heights (the camera is lowered to match):
+
+```powershell
+python tools/import_vmd.py "motions\pv.vmd" `
+  --cache `
+  --camera-vmd "motions\pv_camera.vmd" `
+  --unify-ground
+```
+
 Only bake, writing the intermediate parent-corrected rotation JSON:
 
 ```powershell
@@ -181,6 +199,8 @@ python tools/import_vmd.py "motions\dance.vmd" --bake --output-rotation-json "bu
 - Bone keys use the VMD bezier curves, with rotations interpolated by slerp.
 - Append (付与) rotation/translation bones (shoulder cancel, twist sub-bones, D bones) are evaluated in PMX transform order.
 - Standard leg IK chains (knee hinge + thigh) are solved in closed form, so feet reach their IK targets even when crouching from a straight leg; other IK chains use MMD-style CCD with angle limits. IK on/off keys in the VMD apply per frame, and `--disable-foot-ik` turns all IK off.
+- `--unify-ground` (the UI's "Unify ground height") cancels stage placement heights. Each frame it takes the lowest point of the body that can rest on the floor (toes, ankles, knees, hands, hips, head), keeps its lower envelope — airborne phases up to about one second are ignored, steps and slopes are followed — and moves the whole character so that envelope sits on the rest-pose floor. Scene-cut platform changes stay sharp and slower changes are smoothed. Only the pelvis track carries world position, so only its height changes; the camera track is lowered by the same per-frame amount.
+- Scene cuts are frames where the pelvis moves more than 8 Source units in one frame, and more than 4 times the median step of the 3 frames on either side. Dancing stays below about 10 units a frame, and faster moves build up over several frames, which the median leaves alone; the Project Diva cuts measured are 8 to 1,000. The motion JSON lists them in `cuts` as VMD frames, taken after ground unification. Ground smoothing never spans one. The addon applies the same rule to its built frames (`MMDVMDNPC.BuiltPoseCuts` in `sh_core.lua`). It holds the pose across each cut and raises the networked counter `MMDVMDNPCPoseCut` one server tick ahead. Clients then run the hook `MMDVMDNPCPoseCut(ent, seconds)`, which Model Hotloader's `mmdhl.MarkTeleport` listens to; other physics addons can listen too.
 
 Differences from the previous Blender bake:
 

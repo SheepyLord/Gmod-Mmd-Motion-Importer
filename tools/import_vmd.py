@@ -1771,10 +1771,17 @@ def _source_angles_from_forward_up(forward, up):
     return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
 
 
-def sample_camera_gmod(frames: list[CameraFrame], frame: float) -> tuple[float, float, float, float, float, float, float]:
-    """Entity-local GMod camera sample: (px, py, pz, pitch, yaw, roll, vfov)."""
+def sample_camera_gmod(
+    frames: list[CameraFrame],
+    frame: float,
+    vertical_offset: float = 0.0,
+) -> tuple[float, float, float, float, float, float, float]:
+    """Entity-local GMod camera sample: (px, py, pz, pitch, yaw, roll, vfov).
+    vertical_offset (MMD units) lowers the camera with a ground-unified body."""
     target, rotation, distance, fov = sample_camera_frames(frames, frame)
     eye, forward, up = mmd_camera_pose(target, rotation, distance)
+    if vertical_offset:
+        eye = (eye[0], eye[1] - vertical_offset, eye[2])
     px, py, pz = (_mmd_to_gmod_vec(eye)[i] * CAMERA_POSITION_SCALE for i in range(3))
     pitch, yaw, roll = _source_angles_from_forward_up(_mmd_to_gmod_vec(forward), _mmd_to_gmod_vec(up))
     return px, py, pz, pitch, yaw, roll, fov
@@ -1812,9 +1819,33 @@ def _camera_samples_close(a, b) -> bool:
     return abs(a[6] - b[6]) <= CAMERA_DECIMATE_FOV_EPS
 
 
-def build_camera_track(camera_vmd_path: Path, progress: ProgressCallback | None = None) -> dict | None:
+def rotation_ground_offsets(rotation_source: Path | dict | None) -> list[float] | None:
+    """Per-frame ground-unification offsets (MMD units) recorded by a native
+    bake with unify_ground, from the in-memory document or its JSON file."""
+    if isinstance(rotation_source, dict):
+        offsets = rotation_source.get("_ground_offsets_mmd")
+    elif isinstance(rotation_source, Path) and rotation_source.exists():
+        try:
+            offsets = json.loads(rotation_source.read_text(encoding="utf-8")).get("_ground_offsets_mmd")
+        except (OSError, ValueError, AttributeError):
+            offsets = None
+    else:
+        offsets = None
+    return [float(value) for value in offsets] if offsets else None
+
+
+def build_camera_track(
+    camera_vmd_path: Path,
+    progress: ProgressCallback | None = None,
+    ground_offsets: list[float] | None = None,
+) -> dict | None:
     """Parse a camera VMD and produce the GMod-local camera track dict, or None
-    when the file holds no camera frames."""
+    when the file holds no camera frames.
+
+    ground_offsets (per body frame from 0, MMD units) are the heights a
+    ground-unified bake removed from the character; the camera is lowered by
+    the same amount every frame so it keeps framing the dancer. Frames past the
+    body motion hold its last offset."""
     parsed = parse_vmd(camera_vmd_path)
     frames = parsed.camera_frames
     if not frames:
@@ -1831,7 +1862,16 @@ def build_camera_track(camera_vmd_path: Path, progress: ProgressCallback | None 
             f"camera VMD frame range 0..{frame_end} exceeds the {MAX_BAKE_FRAMES}-frame limit; "
             f"the file may be corrupted: {camera_vmd_path}"
         )
-    samples = [sample_camera_gmod(frames, f) for f in range(frame_start, frame_end + 1)]
+    offsets = list(ground_offsets or [])
+
+    def vertical_offset(frame: int) -> float:
+        if not offsets:
+            return 0.0
+        return offsets[min(max(frame, 0), len(offsets) - 1)]
+
+    samples = [sample_camera_gmod(frames, f, vertical_offset(f)) for f in range(frame_start, frame_end + 1)]
+    if offsets:
+        emit_progress(progress, "Camera lowered with the unified ground height to keep framing the character")
     # Normalize angles once at the sample level; playback interpolates via
     # shortest-path deltas so cumulative multi-turn values are unnecessary.
     samples = [
@@ -1889,7 +1929,7 @@ def build_camera_track(camera_vmd_path: Path, progress: ProgressCallback | None 
         progress,
         f"Camera track: {len(frames)} VMD key(s) over frames {frame_start}-{frame_end}, exported {len(keys)} sampled key(s)",
     )
-    return {
+    track = {
         "format": CAMERA_TRACK_FORMAT,
         "fps": VMD_FPS,
         "frame_start": frame_start,
@@ -1899,6 +1939,9 @@ def build_camera_track(camera_vmd_path: Path, progress: ProgressCallback | None 
         "source": camera_vmd_path.name,
         "keys": keys,
     }
+    if offsets:
+        track["ground_unified"] = True
+    return track
 
 
 def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
@@ -2545,10 +2588,16 @@ def bake_vmd_native(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     disable_foot_ik: bool = False,
+    unify_ground: bool = False,
 ) -> dict:
     """Bake MMD IK and append transforms in-process (no Blender) and return the
     parent-corrected rotation document that write_motion_json consumes. The
-    document is also written to `output_rotation_json` when one is given."""
+    document is also written to `output_rotation_json` when one is given.
+
+    unify_ground cancels stage placement heights: the character's ground
+    contact stays on one floor level (jumps keep their height). The removed
+    per-frame heights are kept in the document for the camera track
+    (rotation_ground_offsets / build_camera_track)."""
     if not vmd_path.exists():
         raise FileNotFoundError(vmd_path)
     mmd_model = mmd_model or find_default_mmd_model()
@@ -2586,6 +2635,7 @@ def bake_vmd_native(
             model_path=mmd_model,
             input_vmd=vmd_path.resolve(),
             disable_ik=disable_foot_ik,
+            unify_ground=unify_ground,
             progress=progress,
             cancel_check=cancel_check,
         )
@@ -2964,6 +3014,14 @@ def write_motion_json(
         parsed = json.loads(rotation_source.read_text(encoding="utf-8"))
     if parsed.get("format") != "mmd_vmd_npc_parent_corrected_axis_v1":
         raise ValueError(f"unsupported parent-corrected motion JSON format: {parsed.get('format')!r}")
+    # Bake-side working data (e.g. _ground_offsets_mmd for the camera) is not
+    # part of the motion file the addon reads.
+    for key in [key for key in parsed if key.startswith("_")]:
+        parsed.pop(key)
+    # Scene cut frames (vmd_baker.detect_pose_cuts); Blender bakes and rotation
+    # JSONs from before the native baker recorded them get them from the pelvis track.
+    if "cuts" not in parsed:
+        parsed["cuts"] = _load_vmd_baker().document_pose_cuts(parsed)
 
     original_input_vmd = parsed.get("input_vmd")
     if flex_vmd_path is None and original_input_vmd:
@@ -3045,6 +3103,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--frame-end", type=int, help="last VMD frame to bake; defaults to the VMD max frame")
     parser.add_argument("--disable-foot-ik", action="store_true",
                         help="mute all IK on the model before baking; use for motions authored without foot IK")
+    parser.add_argument("--unify-ground", action="store_true",
+                        help="cancel stage placement heights: keep the character on one floor level (jumps keep their height) "
+                             "and lower --camera-vmd by the same amount; native bake only")
     parser.add_argument("--install-addon", action="store_true", help="legacy no-op; addon installation is no longer performed")
     parser.add_argument("--output-dir", type=Path, help="override GMod motion JSON output directory")
     parser.add_argument("--gmod-dir", type=Path, help="override Garry's Mod installation directory")
@@ -3066,6 +3127,8 @@ def main(argv: list[str]) -> int:
 
     if args.bake and args.bake_with_blender:
         parser.error("choose either --bake or --bake-with-blender")
+    if args.unify_ground and args.bake_with_blender:
+        parser.error("--unify-ground needs the native bake; it is not available with --bake-with-blender")
     rotation_source: Path | dict | None = None
     if args.bake_with_blender:
         if not args.vmd:
@@ -3097,6 +3160,7 @@ def main(argv: list[str]) -> int:
             output_rotation_json=rotation_json_out,
             progress=print,
             disable_foot_ik=args.disable_foot_ik,
+            unify_ground=args.unify_ground,
         )
     elif args.output_rotation_json:
         rotation_source = args.output_rotation_json
@@ -3114,7 +3178,7 @@ def main(argv: list[str]) -> int:
         if args.camera_vmd:
             if not args.camera_vmd.exists():
                 raise FileNotFoundError(f"camera VMD not found: {args.camera_vmd}")
-            camera_track = build_camera_track(args.camera_vmd, print)
+            camera_track = build_camera_track(args.camera_vmd, print, ground_offsets=rotation_ground_offsets(rotation_source))
         output = write_motion_json(
             rotation_source,
             output_dir,

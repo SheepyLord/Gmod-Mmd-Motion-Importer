@@ -52,6 +52,8 @@
   "inputs.export_addon.tooltip": "Emballe le JSON de mouvement importé et la musique optionnelle dans un .gma distribuable.",
   "inputs.disable_foot_ik": "Désactiver l'IK des pieds (mouvement sans IK)",
   "inputs.disable_foot_ik.tooltip": "Désactive toutes les contraintes IK du modèle (pieds et orteils) avant la cuisson. À utiliser pour les mouvements créés sans IK des pieds — cuits avec l'IK activé, les jambes restent figées dans la pose de repos. Laissez décoché pour les mouvements normaux.",
+  "inputs.unify_ground": "Unifier la hauteur du sol (annuler le placement sur scène)",
+  "inputs.unify_ground.tooltip": "Pour les mouvements qui déplacent le personnage entre des plateformes ou des hauteurs de scène, comme les conversions Project Diva : garde ses pieds au même niveau de sol pendant toute la danse (les sauts gardent leur hauteur) et abaisse la caméra importée d’autant à chaque image. Laissez désactivé pour les mouvements normaux.",
   "inputs.cancel_import": "Annuler l'importation",
   "inputs.progress.title": "Progression de cuisson",
   "inputs.progress.idle": "Aucune cuisson en cours.",

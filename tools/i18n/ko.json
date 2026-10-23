@@ -52,6 +52,8 @@
   "inputs.export_addon.tooltip": "가져온 모션 JSON과 선택 음악을 배포 가능한 .gma 파일로 패키징합니다.",
   "inputs.disable_foot_ik": "발 IK 비활성화 (IK 없는 모션용)",
   "inputs.disable_foot_ik.tooltip": "베이크 전에 모델의 모든 IK 제약(발·발끝)을 끕니다. 발 IK 없이 제작된 모션에 사용하세요 — IK를 켠 채 베이크하면 다리가 기본 자세에 고정됩니다. 일반 모션에서는 꺼 두세요.",
+  "inputs.unify_ground": "지면 높이 통일 (무대 배치 상쇄)",
+  "inputs.unify_ground.tooltip": "캐릭터를 무대의 단상이나 다른 높이로 옮기는 모션(예: Project Diva 변환 모션)용: 춤 전체에서 발을 같은 바닥 높이에 유지하고(점프 높이는 유지) 가져온 카메라도 매 프레임 같은 만큼 내립니다. 일반 모션에서는 끈 채로 두세요.",
   "inputs.cancel_import": "가져오기 취소",
   "inputs.progress.title": "베이크 진행률",
   "inputs.progress.idle": "진행 중인 베이크가 없습니다.",
