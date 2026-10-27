@@ -1519,6 +1519,18 @@ def gmod_sound_output_path(gmod_dir: Path, sound_identifier: str) -> Path:
     return gmod_dir / "garrysmod" / "sound" / GMOD_SOUND_SUBDIR / f"{sound_identifier}.mp3"
 
 
+def gmod_music_file(gmod_dir: Path, sound_rel: str) -> tuple[Path, Path]:
+    """A motion's music file and the folder it must stay inside. This
+    importer writes music into the sound folder; the addon's in-game importer
+    writes it into data/mmd_vmd_npc/music (GMod Lua can write only into data/)
+    and records it as "data/mmd_vmd_npc/music/<id>.<ext>"."""
+    relative = safe_relative_path(sound_rel)
+    garrysmod = gmod_dir / "garrysmod"
+    if relative.parts[0].lower() == "data":
+        return garrysmod / relative, garrysmod / "data" / GMOD_SOUND_SUBDIR
+    return garrysmod / "sound" / relative, garrysmod / "sound"
+
+
 # --- Installed-motion inspection (Motion Manager tab) ------------------------
 def gmod_motions_dir(gmod_dir: Path) -> Path:
     """Where imported motion JSONs live in a GMod install (what the addon reads

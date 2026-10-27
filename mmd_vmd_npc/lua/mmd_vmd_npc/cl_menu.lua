@@ -355,9 +355,14 @@ function MMDVMDNPC.RequestClearAssignedActors(mode)
     net.SendToServer()
 end
 
-function MMDVMDNPC.RequestClearBuiltSelectedMotion(scope)
-    local current = GetConVar("mmd_vmd_npc_motion")
-    local motionID = current and current:GetString() or ""
+-- motionID: optional, the selected motion when omitted (the in-game importer
+-- clears the builds of a motion it just re-imported).
+function MMDVMDNPC.RequestClearBuiltSelectedMotion(scope, motionID)
+    motionID = tostring(motionID or "")
+    if motionID == "" then
+        local current = GetConVar("mmd_vmd_npc_motion")
+        motionID = current and current:GetString() or ""
+    end
     if motionID == "" then
         play_ui_cue("blocked")
         print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
@@ -1721,6 +1726,9 @@ local function start_local_playback(path, playbackEnt, serverStarted)
         -- Server-confirmation clock for the orphan reaper (CurTime, so a
         -- paused game does not age states the server also is not ticking).
         lastServerSync = CurTime(),
+        -- The countdown already blended the dancer into the first pose
+        -- (MMDVMDNPC.StartTransitionSeconds), so the start is no pose cut.
+        cutFrame = (tonumber(MMDVMDNPC.StartTransitionSeconds) or 0) > 0 and math.floor(tonumber(built.frame_start) or 0) or nil,
     }
 end
 
@@ -1940,7 +1948,8 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
 
             -- Hold across scene cuts like the server, and tell physics addons
-            -- on the frame this client's own pose jumps (a cut, the start, a loop).
+            -- on the frame this client's own pose jumps (a cut, a loop; the
+            -- start only without the countdown's blend into the first pose).
             local cuts = state.poseCuts
             if not cuts then
                 cuts = MMDVMDNPC.BuiltPoseCuts(built, ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil)

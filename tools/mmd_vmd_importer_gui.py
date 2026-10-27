@@ -1791,10 +1791,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             sound_rel = str(header.get("music_sound") or "")
             if sound_rel and gmod is not None:
                 try:
-                    sound_root = (gmod / "garrysmod" / "sound").resolve()
-                    sound_path = (sound_root / import_vmd.safe_relative_path(sound_rel)).resolve()
-                    # Never delete outside the GMod sound tree, even if a shared
-                    # motion carried a hostile music path.
+                    sound_file, sound_root = import_vmd.gmod_music_file(gmod, sound_rel)
+                    sound_root = sound_root.resolve()
+                    sound_path = sound_file.resolve()
+                    # Never delete outside the music's own folder, even if a
+                    # shared motion carried a hostile music path.
                     if sound_root in sound_path.parents and sound_path.is_file():
                         sound_path.unlink()
                 except Exception:
@@ -1830,7 +1831,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if not sound_rel or gmod is None:
             return
         try:
-            sound_path = gmod / "garrysmod" / "sound" / import_vmd.safe_relative_path(sound_rel)
+            sound_path, _ = import_vmd.gmod_music_file(gmod, sound_rel)
         except Exception:
             return
         self._reveal_in_file_manager(sound_path)

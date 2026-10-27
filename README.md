@@ -18,7 +18,9 @@ tools/blender_bake_vmd.py    Legacy Blender-side bake script (optional --bake-wi
 tools/preview/               OpenGL PMX/VMD preview renderer
 tools/i18n/                  Importer UI translation files
 tools/build_importer_exe.ps1 PyInstaller build script
+tools/build_ingame_import_data.py Generates the in-game importer's skeleton data
 tools/requirements_importer.txt Python dependencies
+tests/                       Baker tests and the in-game importer's parity tests
 ```
 
 ## Requirements
@@ -120,6 +122,8 @@ The preview view follows the character, so motions that travel or carry stage pl
 
 Scene cuts need no option. When a motion moves the character to another spot in a single frame (Project Diva PV conversions do this at most camera cuts), the addon plays the jump as a cut. It holds the pose before the cut until the cut's frame instead of sliding the dancer across the stage. It also announces the jump to hair and cloth physics, which Model Hotloader then carries across the cut instead of dragging the hair after the body. The bake log lists the cuts it found. The addon finds the same frames in the built animation, so motions imported before this change get the fix too.
 
+The start of a dance is not a jump either. During the start delay the character stands in its reference pose (the T-pose). Over the last 1.5 seconds of the delay it moves into the dance's first pose and onto its starting spot, so a dance that starts elsewhere on the stage no longer teleports the character there. A character that travels stays visible to the player who started it, even when it leaves the area visible from that player's position. Before this, a character dancing for you could freeze out there while the music went on, then jump ahead.
+
 In game, the tool's Build/Playback tab has **Stage placement and movement** options. They apply when playback starts and change only the character's horizontal travel:
 
 - **Stage placement jumps kept (%)**: 100 keeps the jumps to another spot at scene cuts as authored. 0 removes them, so the character keeps dancing where it stood. Values between shorten the jumps. Without the jumps, the walking of each shot adds up and the character can drift far, so pair this with the movement limit. For several dancers in formation, keep 100.
@@ -141,6 +145,27 @@ Imported music is written to:
 ```
 
 The UI remembers Garry's Mod path, language choice, and recent inputs between sessions.
+
+## Importing Inside The Game
+
+With [Model Hotloader](https://steamcommunity.com/sharedfiles/filedetails/?id=3810025467) and its [binary module](https://github.com/SheepyLord/Gmod-Model-Hotloader-with-Vulkan) (2.3.0 or later) installed, motions can be imported without leaving Garry's Mod. Model Hotloader's file access lets the addon read files you choose on your computer: Windows asks you to allow each one (in full screen the dialog opens behind the game; press Alt+Tab). It works in single player and on a server you host.
+
+The tool's Motion tab then shows **Import Animation (VMD)...** above **Open Motion Manager** (the console command `mmdvmd_import` opens it too). Without file access it shows a short notice instead, with a **Resolve** button that explains why and links to both pages.
+
+The import window has the desktop importer's inputs: body motion VMD, music, camera VMD, audio offset, the motion metadata table, face/flex VMDs, **Disable foot IK** and **Unify ground height**. It bakes on the same bundled skeleton with a Lua port of the native baker (`cl_import_bake.lua`), a slice per frame so the game keeps running, and writes the same motion JSON to `data/mmd_vmd_npc/motions/`. The new motion is selected in the tool when the import finishes. Re-importing a motion that changed clears its built animations.
+
+Differences from the desktop importer:
+
+- Music must already be MP3, OGG or WAV. It is copied as it is to `data/mmd_vmd_npc/music/<motion id>.<ext>` (Lua can write only into `data/`). Use the desktop importer to convert other audio or a video.
+- There is no preview, no Garry's Mod folder field and no `.gma` export.
+
+The skeleton data the Lua baker uses is generated from the bundled model and the bone/flex maps. After changing any of them, regenerate it:
+
+```powershell
+python tools/build_ingame_import_data.py
+```
+
+`tests/test_ingame_importer.py` runs the Lua importer under LuaJIT through [lupa](https://pypi.org/project/lupa/) (`python -m pip install lupa`) and compares its output with the Python importer's. It also fails while the generated data is stale.
 
 ## CLI Usage
 

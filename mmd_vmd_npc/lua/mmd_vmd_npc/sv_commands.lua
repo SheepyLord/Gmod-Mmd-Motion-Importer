@@ -2598,7 +2598,25 @@ local function safe_music_sound_path(soundPath)
     return soundPath
 end
 
+-- Music of a motion imported in game: data/mmd_vmd_npc/music/<id>.mp3|ogg|wav
+-- (Lua writes only into data/). Returns the path relative to data/.
+local function safe_data_music_path(soundPath)
+    soundPath = string.Trim(string.Replace(tostring(soundPath or ""), "\\", "/"))
+    local relative = string.match(soundPath, "^data/(.+)$")
+    if not relative or string.find(relative, "..", 1, true) then return nil end
+    local extension = string.match(string.lower(relative), "^mmd_vmd_npc/music/[%w_%-%.]+%.(%w+)$")
+    if extension ~= "mp3" and extension ~= "ogg" and extension ~= "wav" then return nil end
+    return relative
+end
+
 local function try_delete_imported_music(soundPath)
+    local dataPath = safe_data_music_path(soundPath)
+    if dataPath then
+        local existed = file.Exists(dataPath, "DATA") == true
+        file.Delete(dataPath)
+        return "data/" .. dataPath, existed and file.Exists(dataPath, "DATA") ~= true, existed
+    end
+
     local safe = safe_music_sound_path(soundPath)
     if not safe then return "", false, false end
 
@@ -2935,9 +2953,10 @@ local cv_root_motion_origin = CreateConVar(
     "Carry the dance's root travel on the entity origin so characters can walk any distance (0 = legacy bone-offset only)"
 )
 
--- Clients learn that the pose jumps (a scene cut, the start, a loop, the stop)
--- from a networked counter; cl_menu.lua turns it into hook MMDVMDNPCPoseCut for
--- hair and cloth physics. See MMDVMDNPC.BuiltPoseCuts.
+-- Clients learn that the pose jumps (a scene cut, a loop, the stop; the start
+-- only when the countdown did not blend into the first pose, see
+-- apply_start_transition) from a networked counter; cl_menu.lua turns it into
+-- hook MMDVMDNPCPoseCut for hair and cloth physics. See MMDVMDNPC.BuiltPoseCuts.
 local function bump_pose_cut(ent)
     if not IsValid(ent) then return end
     local name = MMDVMDNPC.PoseCutNW2
@@ -2975,7 +2994,9 @@ do
 
     -- travelX/travelY: the pelvis horizontal travel under the stage-placement
     -- and movement options (MMDVMDNPC.BuiltTravel), when they change it.
-    apply_built_sample = function(ent, frameA, frameB, fraction, pelvisZOffset, state, travelX, travelY)
+    -- weight: the start transition's share of the sample, from the reference
+    -- pose (0) to the sample (1), travel and face included; nil is all of it.
+    apply_built_sample = function(ent, frameA, frameB, fraction, pelvisZOffset, state, travelX, travelY, weight)
         if not is_usable_npc(ent) then return end
 
         frameA = frameA or {}
@@ -2984,6 +3005,7 @@ do
         pelvisZOffset = tonumber(pelvisZOffset) or 0
         local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
         local rootMotion = state ~= nil and cv_root_motion_origin:GetBool()
+        local blend = weight ~= nil and weight < 1 and math.max(0, weight) or nil
 
         local manipulatePosition = ent.ManipulateBonePosition
         local bonesB = frameB.bones or {}
@@ -2994,30 +3016,33 @@ do
                 local x = lerp_value(boneA[5], boneB[5], fraction)
                 local y = lerp_value(boneA[6], boneB[6], fraction)
                 local z = lerp_value(boneA[7], boneB[7], fraction)
-                if pelvisBone and bone == pelvisBone then
+                local isPelvis = pelvisBone ~= nil and bone == pelvisBone
+                if isPelvis then
                     if travelX then x, y = travelX, travelY end
                     z = z + pelvisZOffset
-                    if rootMotion then
-                        -- Anchor once to the dance-start transform (set eagerly at
-                        -- playback start; guarded here for safety), then move the
-                        -- origin by the pelvis's horizontal travel rotated into
-                        -- world space. The manipulation keeps only the vertical
-                        -- component, which stays far inside the networked range.
-                        if not state.rootBase then
-                            state.rootBase = ent:GetPos()
-                            state.rootYaw = Angle(0, ent:GetAngles().y or 0, 0)
-                        end
-                        local travel = Vector(x, y, 0)
-                        travel:Rotate(state.rootYaw)
-                        ent:SetPos(state.rootBase + travel)
-                        x = 0
-                        y = 0
-                    end
                 end
-                setAngle(sampleAngle,
-                    lerp_angle_value(boneA[2], boneB[2], fraction),
-                    lerp_angle_value(boneA[3], boneB[3], fraction),
-                    lerp_angle_value(boneA[4], boneB[4], fraction))
+                if blend then x, y, z = x * blend, y * blend, z * blend end
+                if isPelvis and rootMotion then
+                    -- Anchor once to the dance-start transform (set eagerly at
+                    -- playback start; guarded here for safety), then move the
+                    -- origin by the pelvis's horizontal travel rotated into
+                    -- world space. The manipulation keeps only the vertical
+                    -- component, which stays far inside the networked range.
+                    if not state.rootBase then
+                        state.rootBase = ent:GetPos()
+                        state.rootYaw = Angle(0, ent:GetAngles().y or 0, 0)
+                    end
+                    local travel = Vector(x, y, 0)
+                    travel:Rotate(state.rootYaw)
+                    ent:SetPos(state.rootBase + travel)
+                    x = 0
+                    y = 0
+                end
+                local p = lerp_angle_value(boneA[2], boneB[2], fraction)
+                local yaw = lerp_angle_value(boneA[3], boneB[3], fraction)
+                local r = lerp_angle_value(boneA[4], boneB[4], fraction)
+                if blend then p, yaw, r = MMDVMDNPC.PartialRotation(p, yaw, r, blend) end
+                setAngle(sampleAngle, p, yaw, r)
                 ent:ManipulateBoneAngles(bone, sampleAngle, true)
                 if manipulatePosition then
                     setVector(sampleVector, x, y, z)
@@ -3031,7 +3056,7 @@ do
                 local flexB = (frameB.flexes or {})[index] or flexA
                 local flexID = tonumber(flexA[1]) or -1
                 if flexID >= 0 then
-                    ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction), 0, 1))
+                    ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction) * (blend or 1), 0, 1))
                 end
             end
         end
@@ -3692,6 +3717,38 @@ function MMDVMDNPC.TogglePlaybackPauseForPlayer(ply, ent)
     return true, paused and "paused" or "resumed"
 end
 
+-- The countdown's last MMDVMDNPC.StartTransitionSeconds blend the dancer from
+-- the reference (T-)pose into the pose the dance opens with, origin included,
+-- so it moves to its start spot instead of appearing there when the dance
+-- starts; the first dance tick then continues from that pose.
+local function apply_start_transition(ent, state, now, delayUntil)
+    local length = math.min(tonumber(MMDVMDNPC.StartTransitionSeconds) or 0, tonumber(state.startDelay) or 0)
+    if length <= 0 or delayUntil - now >= length then return end
+    if now < (state.nextTick or 0) then return end
+    state.nextTick = now + (1 / clamp_playback_hz(state.playbackHz))
+
+    local built = state.built or {}
+    local frames = built.frames or {}
+    if #frames <= 0 then return end
+    local startFrame = math.floor(tonumber(built.frame_start) or 0)
+    local endFrame = math.floor(tonumber(built.frame_end) or startFrame)
+    local sourceFPS = math.max(1, tonumber(built.fps) or MMDVMDNPC.VMDFPS or 30)
+    -- The frame the dance shows the moment the countdown ends.
+    local frame = math.Clamp(math.floor(startFrame + (delayUntil - (tonumber(state.started) or delayUntil)) * sourceFPS), startFrame, endFrame)
+    local index = math.Clamp(frame - startFrame + 1, 1, #frames)
+    local travelX, travelY
+    if state.travel then
+        travelX, travelY = state.travel.x[index] or 0, state.travel.y[index] or 0
+    end
+
+    -- Eased at both ends: it leaves the T-pose and settles into the first pose.
+    local progress = math.Clamp(1 - (delayUntil - now) / length, 0, 1)
+    local weight = progress * progress * (3 - 2 * progress)
+    -- The pose does not jump when the dance takes over, so that is no cut.
+    state.cutFrame, state.cutThrough = frame, frame
+    apply_built_sample(ent, frames[index], frames[index], 0, state.pelvisZOffset or 0, state, travelX, travelY, weight)
+end
+
 local function update_playback_state(ent, state, now)
     if not is_usable_npc(ent) then
         MMDVMDNPC.Playbacks[ent] = nil
@@ -3740,6 +3797,7 @@ local function update_playback_state(ent, state, now)
     if delayUntil > now then
         force_reference_pose(ent)
         stop_actor_motion(ent)
+        apply_start_transition(ent, state, now, delayUntil)
         apply_runtime_eye_tracking(ent, state, now)
         if now >= (state.nextCountdownStatus or 0) then
             state.nextCountdownStatus = now + 0.25
@@ -3984,6 +4042,19 @@ hook.Add("Think", "MMDVMDNPCBuiltPlaybackThink", function()
         end
     end
     if update_rpe_body_suppression then update_rpe_body_suppression() end
+end)
+
+-- Root motion carries a dancer anywhere, and the server only sends a player
+-- what the PVS around that player's position covers: a self-playback dancer
+-- left the PVS of its hidden owner, who stays at the start spot while the
+-- camera follows the dance, so it froze there and then jumped ahead. Keep each
+-- dancer in the PVS of the player who started it.
+hook.Add("SetupPlayerVisibility", "MMDVMDNPCPlaybackVisibility", function(ply)
+    for ent, state in pairs(MMDVMDNPC.Playbacks) do
+        if state.ply == ply and IsValid(ent) then
+            AddOriginToPVS(ent:GetPos())
+        end
+    end
 end)
 
 function MMDVMDNPC.OpenDebugForPlayer(ply, ent, motionID, vmdFrame)

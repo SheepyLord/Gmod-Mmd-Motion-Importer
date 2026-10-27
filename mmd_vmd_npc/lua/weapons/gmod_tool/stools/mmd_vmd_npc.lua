@@ -388,11 +388,7 @@ function TOOL.BuildCPanel(panel)
         return header
     end
 
-    local function colored_button(parent, text, color, callback)
-        local button = vgui.Create("DButton")
-        button:SetText(text)
-        button:SetTall(30)
-        button.DoClick = callback
+    local function paint_colored_button(button, color)
         button.Paint = function(self, w, h)
             local c = color or Color(70, 120, 190)
             if self:IsHovered() then
@@ -402,6 +398,14 @@ function TOOL.BuildCPanel(panel)
             draw.SimpleText(self:GetText(), "DermaDefaultBold", w * 0.5, h * 0.5, Color(255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
             return true
         end
+    end
+
+    local function colored_button(parent, text, color, callback)
+        local button = vgui.Create("DButton")
+        button:SetText(text)
+        button:SetTall(30)
+        button.DoClick = callback
+        paint_colored_button(button, color)
         parent:AddItem(button)
         return button
     end
@@ -933,6 +937,69 @@ function TOOL.BuildCPanel(panel)
     refresh_motion_list()
     hook.Add("MMDVMDNPCMotionListUpdated", hookID, refresh_motion_list)
 
+    -- In-game ("hot") motion import reads the player's files through Model
+    -- Hotloader's file access: the import button while that is available,
+    -- otherwise a small notice with a Resolve button (cl_importer.lua).
+    local importHolder = vgui.Create("DPanel")
+    importHolder:SetPaintBackground(false)
+    importHolder:SetTall(30)
+    motionTab:AddItem(importHolder)
+    local importState
+    local function update_import_control()
+        if not IsValid(importHolder) then return end
+        local available, reason, code = false, L("mmd_vmd_npc.import.not_installed"), "not_installed"
+        if MMDVMDNPC.ImporterAvailability then available, reason, code = MMDVMDNPC.ImporterAvailability() end
+        local state = available and "available" or (tostring(code) .. ":" .. tostring(reason))
+        if state == importState then return end
+        importState = state
+        importHolder:Clear()
+        importHolder.PerformLayout = nil
+        importHolder.Think = nil
+        if available then
+            local importButton = vgui.Create("DButton", importHolder)
+            importButton:Dock(FILL)
+            importButton:SetText(L("mmd_vmd_npc.import.button"))
+            importButton:SetTooltip(L("mmd_vmd_npc.import.button_tip"))
+            importButton.DoClick = function() MMDVMDNPC.OpenMotionImporter() end
+            paint_colored_button(importButton, Color(46, 150, 90))
+            importHolder:SetTall(30)
+        else
+            local resolveButton = vgui.Create("DButton", importHolder)
+            resolveButton:SetText(L("mmd_vmd_npc.import.resolve"))
+            resolveButton:SetWide(80)
+            resolveButton:SetTall(24)
+            resolveButton.DoClick = function() MMDVMDNPC.OpenImporterResolve() end
+            local notice = vgui.Create("DLabel", importHolder)
+            notice:SetFont("DermaDefault")
+            notice:SetTextColor(Color(255, 170, 70))
+            notice:SetWrap(true)
+            notice:SetAutoStretchVertical(true)
+            notice:SetText(code == "not_installed" and reason or L("mmd_vmd_npc.import.unavailable_short"))
+            notice:SetTooltip(reason)
+            importHolder.PerformLayout = function(self, w)
+                resolveButton:SetPos(w - resolveButton:GetWide(), 0)
+                notice:SetPos(0, 0)
+                notice:SetWide(math.max(40, w - resolveButton:GetWide() - 6))
+            end
+            -- The wrapped notice sets its own height; the row follows it.
+            importHolder.Think = function(self)
+                local need = math.max(resolveButton:GetTall(), notice:GetTall())
+                if self:GetTall() ~= need then
+                    self:SetTall(need)
+                    local wrapper = self:GetParent()
+                    if IsValid(wrapper) then wrapper:InvalidateLayout() end
+                    motionTab:InvalidateLayout()
+                end
+            end
+        end
+        importHolder:InvalidateLayout()
+        local wrapper = importHolder:GetParent()
+        if IsValid(wrapper) then wrapper:InvalidateLayout() end
+        motionTab:InvalidateLayout()
+    end
+    update_import_control()
+    hook.Add("MMDVMDNPCImportAvailabilityChanged", hookID .. "_Import", update_import_control)
+
     colored_button(motionTab, L("mmd_vmd_npc.ui.open_motion_manager"), Color(60, 130, 210), function()
         RunConsoleCommand("mmdvmd_menu")
     end)
@@ -1303,6 +1370,7 @@ function TOOL.BuildCPanel(panel)
         hook.Remove("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details")
         hook.Remove("MMDVMDNPCAudioSettingsUpdated", hookID .. "_Audio")
         hook.Remove("MMDVMDNPCPauseStatusUpdated", hookID .. "_Pause")
+        hook.Remove("MMDVMDNPCImportAvailabilityChanged", hookID .. "_Import")
     end
     update_target()
     update_assignments()
