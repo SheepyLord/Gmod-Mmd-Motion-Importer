@@ -124,11 +124,11 @@ Scene cuts need no option. When a motion moves the character to another spot in 
 
 The start of a dance is not a jump either. During the start delay the character stands in its reference pose (the T-pose). Over the last 1.5 seconds of the delay it moves into the dance's first pose and onto its starting spot, so a dance that starts elsewhere on the stage no longer teleports the character there. A character that travels stays visible to the player who started it, even when it leaves the area visible from that player's position. Before this, a character dancing for you could freeze out there while the music went on, then jump ahead.
 
-In game, the tool's Build/Playback tab has **Stage placement and movement** options. They apply when playback starts and change only the character's horizontal travel:
+In game, the tool's Build/Playback tab has **Stage placement and movement** options. They apply when playback starts and change only the character's horizontal travel. They all work around the spot where the NPC or player stood when the dance was started, not the dance's first frame: a stage-placed motion can open far across its stage, and moving there counts as a stage placement jump too.
 
-- **Stage placement jumps kept (%)**: 100 keeps the jumps to another spot at scene cuts as authored. 0 removes them, so the character keeps dancing where it stood. Values between shorten the jumps. Without the jumps, the walking of each shot adds up and the character can drift far, so pair this with the movement limit. For several dancers in formation, keep 100.
-- **Movement range (%)**: shrinks how far the dance moves the character from where it starts; 0 dances on the spot. Only the dance's path (a one-second moving average) is scaled, not the hip sway around it, so the dance keeps its feel.
-- **Movement limit (units, 0 = none)**: keeps the character within this distance of where the dance starts, easing in near the edge instead of stopping as if at a wall.
+- **Stage placement jumps kept (%)**: 100 keeps the jumps to another spot as authored, the one to the dance's first spot and those at scene cuts. 0 removes them, so the character dances where it stood. Values between shorten the jumps. Without the jumps, the walking of each shot adds up and the character can drift far, so pair this with the movement limit. For several dancers in formation, keep 100.
+- **Movement range (%)**: shrinks how far the dance moves the character from where it stood; 0 dances on the spot. Only the dance's path (a one-second moving average) is scaled, not the hip sway around it, so the dance keeps its feel.
+- **Movement limit (units, 0 = none)**: keeps the character within this distance of where it stood, easing in near the edge instead of stopping as if at a wall.
 
 An imported camera moves with the character, so it keeps framing the character.
 
